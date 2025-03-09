@@ -1,0 +1,13 @@
+{
+    "jsonrpc": "2.0",
+    "id": "ID_PLACEHOLDER",
+    "method": "sendTransaction",
+    "params": [
+        "TRANSACTION_PLACEHOLDER",
+        {
+            "maxRetries": 0,
+            "encoding": "base64",
+            "preflightCommitment": "processed"
+        }
+    ]
+}

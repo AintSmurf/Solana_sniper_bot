@@ -1,20 +1,8 @@
 {
+    "id": "1",
     "jsonrpc": "2.0",
-    "id": 420,
-    "method": "transactionSubscribe",
+    "method": "getProgramAccounts",
     "params": [
-        {
-            "failed": false,
-            "accountInclude": [
-                "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
-            ]
-        },
-        {
-            "commitment": "processed",
-            "encoding": "base64",
-            "transactionDetails": "full",
-            "showRewards": true,
-            "maxSupportedTransactionVersion": 0
-        }
+        "4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4T"
     ]
 }

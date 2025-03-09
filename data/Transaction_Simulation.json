@@ -5,6 +5,8 @@
     "params": [
         "TOKEN_MINT_PLACE_HOLDER",
         {
+            "sigVerify": false,
+            "replaceRecentBlockhash": true,
             "encoding": "base64"
         }
     ]

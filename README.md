@@ -78,6 +78,10 @@ python app.py
 - **Enhance Scam Detection Algorithms**: Continuous improvements for accuracy.
 - **Improve Performance & Scalability**: Optimizations for better efficiency.
 
+ ## Separate Log Storage
+   * info.log → All logs (DEBUG, INFO, WARNING, ERROR).
+   * debug.log → Only DEBUG logs.
+   * log.info → Only INFO & WARNINGS
 ## Disclaimer
 
 This project is for educational purposes only.

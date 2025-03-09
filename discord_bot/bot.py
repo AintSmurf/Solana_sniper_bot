@@ -7,8 +7,10 @@ import logging
 from utilities.credentials_utility import CredentialsUtility
 from utilities.excel_utility import ExcelUtility
 from datetime import datetime
+from helpers.logging_manager import LoggingHandler
 
-logger = logging.getLogger(__name__)
+# Set up logger
+logger = LoggingHandler.get_logger()
 
 
 class Discord_Bot:
@@ -92,36 +94,31 @@ class Discord_Bot:
         try:
             df = pd.read_csv(filepath)
 
-            if "SentToDiscord" not in df.columns:
-                df["SentToDiscord"] = False
-
             last_processed = self.last_row_counts.get(filepath, 0)
             total_rows = len(df)
 
             if total_rows > last_processed:
-                new_rows = df.iloc[last_processed:]
+                new_rows = df.loc[~df["SentToDiscord"]]  # Filter rows not sent
 
                 for index, row in new_rows.iterrows():
-                    if not row["SentToDiscord"]:
-                        token_mint = row["Token Mint"]
-                        token_owner = row["Token Owner"]
-                        liquidity = row["Liquidity (Estimated)"]
-                        market_cap = row["Market Cap"]
-                        dexscreener_link = (
-                            f"https://dexscreener.com/solana/{token_mint}"
-                        )
+                    token_mint = row["Token Mint"]
+                    token_owner = row["Token Owner"]
+                    liquidity = row["Liquidity (Estimated)"]
+                    market_cap = row["Market Cap"]
+                    dexscreener_link = f"https://dexscreener.com/solana/{token_mint}"
 
-                        await self.send_message_from_sniper(
-                            token_mint,
-                            token_owner,
-                            liquidity,
-                            market_cap,
-                            message_type,
-                            dexscreener_link,
-                        )
-                        df.at[index, "SentToDiscord"] = True
+                    await self.send_message_from_sniper(
+                        token_mint,
+                        token_owner,
+                        liquidity,
+                        market_cap,
+                        message_type,
+                        dexscreener_link,
+                    )
 
-                df.to_csv(filepath, index=False)
+                    df.loc[index, "SentToDiscord"] = True  # Update sent status
+
+                df.to_csv(filepath, index=False)  # Save changes
                 logger.info(f"✅ Updated {filename}, marked sent messages.")
                 self.last_row_counts[filepath] = total_rows
 

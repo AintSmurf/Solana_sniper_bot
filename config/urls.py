@@ -15,3 +15,4 @@ JUPITER_STATION = {
     "QUOTE_ENDPOINT": "/swap/v1/quote",
     "SWAP_ENDPOINT": "/swap/v1/swap",
 }
+RAYDIUM = {"BASE_URL": "https://api-v3.raydium.io", "LIQUIDITY": "/pools/info/mint"}

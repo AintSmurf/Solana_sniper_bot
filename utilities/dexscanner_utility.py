@@ -1,7 +1,7 @@
 from requests import get
 from config.urls import DEXSCANNER
 from utilities.requests_utility import RequestsUtility
-from helpers.logging_handler import LoggingHandler
+from helpers.logging_manager import LoggingHandler
 
 # set up logger
 logger = LoggingHandler.get_logger()

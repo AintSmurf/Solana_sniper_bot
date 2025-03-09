@@ -1,6 +1,6 @@
 from config.urls import RUGCHECK
 from utilities.requests_utility import RequestsUtility
-from helpers.logging_handler import LoggingHandler
+from helpers.logging_manager import LoggingHandler
 from pprint import pprint
 
 # set up logger
@@ -21,31 +21,47 @@ class RugCheckUtility:
         return data["score"] <= 3000
 
     def is_liquidity_unlocked(self, token_address):
-        """
-        Checks if a token's liquidity is unlocked or at risk of being unlocked soon.
-        """
         logger.info(f"🔍 Checking token liquidity for {token_address} ...")
-        url = self.token_risk + f"/{token_address}/report/summary"
-        data = self.requests_utility.get(url)
+        url = self.token_risk + f"/{token_address}/report"
+        token_data = self.requests_utility.get(url)
 
-        for risk in data.get("risks", []):
-            risk_name = risk.get("name", "")
-            risk_description = risk.get("description", "")
+        risks = token_data.get("risks", [])
+        total_liquidity = token_data.get("totalMarketLiquidity", 0)
+        total_holders = token_data.get("totalHolders", 0)
+        top_holders = token_data.get("topHolders", [])
 
-            logger.debug(f"🛠️ Risk found: {risk}")
-            if (
-                "LP Unlocked" in risk_name
-                or "LP tokens are unlocked" in risk_description
-            ):
+        # Check for major risk flags
+        for risk in risks:
+            if risk["level"] == "danger":
+                logger.warning(f"🚨 HIGH RISK: {risk['name']} - {risk['description']}")
+                return False  # Don't trade
+
+        #  Check if LP is fully unlocked (Rug Pull Risk)
+        lp_unlocked = token_data.get("markets", [{}])[0].get("lpUnlocked", 0)
+        lp_locked = token_data.get("markets", [{}])[0].get("lpLocked", 0)
+        if lp_unlocked > 0 and lp_locked == 0:
+            logger.warning("🚨 LP is 100% UNLOCKED - High rug pull risk!")
+            return False
+
+        # Check top holders for insider control
+        if top_holders:
+            biggest_holder_pct = top_holders[0].get("pct", 0)
+            if biggest_holder_pct > 50:
                 logger.warning(
-                    f"🚨 Token {token_address} has UNLOCKED liquidity! (Rug Pull Risk)"
+                    f"🚨 TOP HOLDER OWNS {biggest_holder_pct:.2f}% - High risk of manipulation!"
                 )
-                return True
+                return False
 
-            if "LP Unlock in" in risk_name and "will unlock soon" in risk_description:
-                logger.warning(
-                    f"⚠️ Token {token_address} liquidity will UNLOCK SOON! (High Rug Pull Risk)"
-                )
-                return True
-        logger.info(f"✅ Token {token_address} has locked liquidity (Safe).")
-        return False
+        # Check if liquidity is too low (Prevents trading illiquid tokens)
+        if total_liquidity < 10_000:
+            logger.warning(f"🚨 LOW LIQUIDITY: Only ${total_liquidity:.2f} available!")
+            return False
+
+        #  Check if the token has too few holders
+        if total_holders < 100:
+            logger.warning(f"🚨 LOW HOLDERS: Only {total_holders} holders exist!")
+            return False
+
+        # If no major risks detected, it’s safe to trade
+        logger.info("✅ Token passes risk check!")
+        return True
