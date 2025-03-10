@@ -3,7 +3,6 @@ from discord_bot.bot import Discord_Bot
 from connectors.helius_connector import HeliusConnector
 from helpers.logging_manager import LoggingHandler
 from helpers.solana_manager import SolanaHandler
-from connectors.liquidity_connector import DataManager
 from utilities.rug_check_utility import RugCheckUtility
 import threading
 import time
@@ -92,4 +91,4 @@ def test():
 
 
 if __name__ == "__main__":
-    test()
+    main()

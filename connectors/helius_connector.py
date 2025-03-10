@@ -63,6 +63,8 @@ class HeliusConnector:
             tx_data = self.requests_utility.post(
                 endpoint=self.api_key["API_KEY"], payload=self.transaction_payload
             )
+            logger.debug(f"transaction test:{tx_data}")
+
 
             post_token_balances = (
                 tx_data.get("result", {}).get("meta", {}).get("postTokenBalances", [])
@@ -75,9 +77,6 @@ class HeliusConnector:
                 post_token_balances[0]["owner"] if post_token_balances else "N/A"
             )
 
-            pre_balances = (
-                tx_data.get("result", {}).get("meta", {}).get("preBalances", [])
-            )
             post_balances = (
                 tx_data.get("result", {}).get("meta", {}).get("postBalances", [])
             )
@@ -104,7 +103,7 @@ class HeliusConnector:
             if token_mint == "So11111111111111111111111111111111111111112":
                 logger.info("⏩ Ignoring transaction: This is a SOL transaction.")
                 return
-            liquidity = 0
+            liquidity = self.solana_manger.calculate_liquidity(post_token_balances,token_mint)
             market_cap = "N/A"
 
             now = datetime.now()

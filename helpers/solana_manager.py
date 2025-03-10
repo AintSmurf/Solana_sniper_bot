@@ -179,6 +179,16 @@ class SolanaHandler:
         return float(
             response["data"]["So11111111111111111111111111111111111111112"]["price"]
         )
+    
+    def get_token_price(self,token_mint) -> float:
+        url = f"/price/v2?ids={token_mint}"
+        response = self.jupiter_requests.get(
+            endpoint=url
+        )
+        logger.info(response)
+        return float(
+            response["data"][token_mint]["price"]
+        )
 
     def get_solana_token_worth_in_dollars(self, usd_amount: int) -> float:
         sol_price = float(self.get_sol_price())
@@ -510,3 +520,35 @@ class SolanaHandler:
         except Exception as e:
             logger.error(f"❌ Error fetching contract code from Helius: {e}")
             return False
+
+    def calculate_liquidity(self,post_token_balances,new_token_mint:str) -> float:
+        try:
+            logger.info("calculating liquidity")
+            sol_amount = 0
+            mint_amount = 0
+            for balance in post_token_balances:
+                mint = balance['mint']
+                amount = balance['uiTokenAmount']['uiAmount']
+
+                if mint == 'So11111111111111111111111111111111111111112':  
+                    sol_amount = amount
+                elif mint == new_token_mint: 
+                    mint_amount = amount
+
+            # Calculate liquidity values
+            liquidity_value_sol = sol_amount * self.get_sol_price()
+            liquidity_value_new_token = mint_amount * self.get_token_price2(new_token_mint)
+            total_liquidity_value = liquidity_value_sol + liquidity_value_new_token
+            logger.info(f"Token liquidty: {total_liquidity_value}")
+            return total_liquidity_value
+
+        except Exception as e:
+            logger.error(f"failed to retrive liquidity: {e}")
+
+        return None
+    def get_token_price2(self,token_mint:str)->float:
+        response = requests.get(f"https://pro-api.coingecko.com/api/v3/simple/token_price/{token_mint}")
+        if response.status_code == 200:
+            return response.json()[token_mint]['usd']
+        else:
+            raise Exception("Error fetching price data")
