@@ -227,3 +227,15 @@ class LoggingHandler:
             except Exception as e:
                 print(f"⚠️ Failed to backup {log_path}: {e}")
 
+    @staticmethod
+    def get_named_logger(name: str):
+        """Returns a custom logger with the same base config as the main app logger."""
+        base_logger = LoggingHandler.get_logger()
+        named_logger = logging.getLogger(name)
+        named_logger.setLevel(base_logger.level)
+
+        if not named_logger.handlers:
+            for handler in base_logger.handlers:
+                named_logger.addHandler(handler)
+
+        return named_logger

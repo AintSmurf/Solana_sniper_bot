@@ -45,3 +45,17 @@ class ExcelUtility:
                 logger.warning(f"⚠️ Token {token_mint} not found in {filepath}")
         except Exception as e:
             logger.error(f"❌ Failed to remove token from {filepath}: {e}")
+    def load_closed_positions(self, simulated=False):
+        filename = "simulated_closed_positions.csv" if simulated else "closed_positions.csv"
+        filepath = os.path.join(self.BOUGHT_TOKENS, filename)
+
+        if not os.path.exists(filepath):
+            logger.warning(f"⚠️ {filename} does not exist yet.")
+            return pd.DataFrame()  # return empty DataFrame
+
+        try:
+            return pd.read_csv(filepath)
+        except Exception as e:
+            logger.error(f"❌ Failed to load {filename}: {e}")
+            return pd.DataFrame()
+

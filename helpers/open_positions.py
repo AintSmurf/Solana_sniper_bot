@@ -10,6 +10,8 @@ import threading
 from config.bot_settings import BOT_SETTINGS
 
 logger = LoggingHandler.get_logger()
+tracker_logger = LoggingHandler.get_named_logger("tracker")
+
 
 
 class OpenPositionTracker:
@@ -31,7 +33,6 @@ class OpenPositionTracker:
             self.file_path = os.path.join(self.excel_utility.BOUGHT_TOKENS, "simulated_tokens.csv")
 
     def track_positions(self,stop_event):
-        logger = LoggingHandler.get_logger()
         logger.info("📚 Starting to track open positions from Excel...")
 
         while not stop_event.is_set() or self.has_open_positions():
@@ -99,9 +100,11 @@ class OpenPositionTracker:
                     logger.info(
                         f"🔎 Tracking {token_mint}... Buy: ${buy_price_usd:.10f}, Current: ${current_price_usd:.10f}, TP: ${take_profit_price:.10f}, SL: ${stop_loss_price:.10f}, Change: {change:.2f}%"
                     )
+                    tracker_logger.info(f"🔎 Tracking {token_mint}... Buy: ${buy_price_usd:.10f}, Current: ${current_price_usd:.10f}, TP: ${take_profit_price:.10f}, SL: ${stop_loss_price:.10f}, Change: {change:.2f}%")
 
                     if current_price_usd >= take_profit_price:
                         logger.info(f"🎯 TAKE PROFIT triggered for {token_mint}!")
+                        tracker_logger.info(f"🎯 TAKE PROFIT triggered for {token_mint}!")
                         if row["type"] == "SIMULATED_BUY":
                             self.simulated_sell_and_log(row, current_price_usd, trigger="TP")
                         else:
@@ -110,6 +113,7 @@ class OpenPositionTracker:
 
                     if current_price_usd <= stop_loss_price:
                         logger.info(f"🚨 STOP LOSS triggered for {token_mint}!")
+                        tracker_logger.info(f"🚨 STOP LOSS triggered for {token_mint}!")
                         if row["type"] == "SIMULATED_BUY":
                             self.simulated_sell_and_log(row, current_price_usd, trigger="SL")
                         else:

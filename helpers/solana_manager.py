@@ -623,13 +623,14 @@ class SolanaHandler:
 
         return None
     # For Raydium-based logs
-    def parse__raydium_liquidity_logs(self, logs: list[str], token_mint: str) -> dict:
+    def parse__raydium_liquidity_logs(self, logs: list[str], token_mint: str, transaction: dict) -> dict:
         result = {
             "itsa": None,
             "yta": None,
-            "itsa_decimals": 6,  # Default USDC
-            "yta_decimals": 9,   # Default memecoin
+            "itsa_decimals": 6,
+            "yta_decimals": 9,
             "source": None,
+            "itsa_mint": None,
         }
 
         for log in logs:
@@ -647,8 +648,8 @@ class SolanaHandler:
                     result["yta"] = int(yta_match.group(1))
                     result["source"] = "strategy"
 
-            if "initialize2: InitializeInstruction2" in log:
-                logger.debug(f"🔍 Raw initialize2 log: {log}")
+            if "initialize" in log and ("init_pc_amount" in log or "init_coin_amount" in log):
+                logger.debug(f"🔍 Raydium init log: {log}")
                 pc_match = re.search(r"init_pc_amount:\s*([0-9]+)", log)
                 coin_match = re.search(r"init_coin_amount:\s*([0-9]+)", log)
 
@@ -656,8 +657,28 @@ class SolanaHandler:
                     result["itsa"] = int(pc_match.group(1))
                     result["itsa_decimals"] = 9
                     result["source"] = "raydium"
+
                 if coin_match:
                     result["yta"] = int(coin_match.group(1))
+                    result["source"] = "raydium"
+
+        # ✅ Fallback: Token balances
+        if (
+            (result["yta"] is None or result["yta"] == 0 or result["itsa"] is None or result["itsa"] == 0)
+            and "postTokenBalances" in transaction.get("meta", {})
+        ):
+            for balance in transaction["meta"]["postTokenBalances"]:
+                mint = balance.get("mint")
+                amount = int(balance["uiTokenAmount"]["amount"])
+                decimals = balance["uiTokenAmount"]["decimals"]
+
+                if mint == token_mint and (result["yta"] is None or result["yta"] == 0):
+                    result["yta"] = amount
+                    result["yta_decimals"] = decimals
+                elif mint != token_mint and (result["itsa"] is None or result["itsa"] == 0):
+                    result["itsa"] = amount
+                    result["itsa_decimals"] = decimals
+                    result["itsa_mint"] = mint
                     result["source"] = "raydium"
 
         return self._calculate_liquidity(result, token_mint)
@@ -722,34 +743,51 @@ class SolanaHandler:
                 logger.warning(f"⚠️ Failed to fetch decimals for {token_mint}: {e}")
                 result["yta_decimals"] = 9
 
-            itsa_usd = result["itsa"] / (10 ** result["itsa_decimals"])
-            SOL_MINTS = {
-                "So11111111111111111111111111111111111111112", 
+            # Known base mints
+            KNOWN_BASES = {
+                "So11111111111111111111111111111111111111112": {"decimals": 9, "symbol": "SOL"},
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": {"decimals": 6, "symbol": "USDC"},
+                "Es9vMFrzaCERc1eZqDum62vD9BTezVXNid1QH2G2Vw5B": {"decimals": 6, "symbol": "USDT"},
             }
-            is_sol = result.get("itsa_mint") in SOL_MINTS or result["itsa_decimals"] == 9
 
-            if result["source"] in ["raydium", "pumpfun"] and is_sol:
-                try:
-                    sol_price = self.get_sol_price()
-                    itsa_usd *= sol_price
-                except Exception as e:
-                    logger.warning(f"⚠️ Failed to fetch SOL price: {e}")
+            itsa_mint = result.get("itsa_mint")
+            itsa_decimals = result["itsa_decimals"]
+            itsa_amount = result["itsa"] / (10 ** itsa_decimals)
+            itsa_usd = 0
+
+            if result["source"] in ["raydium", "pumpfun"]:
+                if itsa_mint in KNOWN_BASES:
+                    base_symbol = KNOWN_BASES[itsa_mint]["symbol"]
+                    if base_symbol == "SOL":
+                        try:
+                            sol_price = self.get_sol_price()
+                            itsa_usd = itsa_amount * sol_price
+                        except Exception as e:
+                            logger.warning(f"⚠️ Failed to fetch SOL price: {e}")
+                            itsa_usd = 0
+                    elif base_symbol in {"USDC", "USDT"}:
+                        itsa_usd = itsa_amount  # Already USD
+                else:
+                    # fallback if base mint is unknown
+                    logger.warning(f"⚠️ Unknown base mint for ITSA: {itsa_mint}, assuming USD = 0")
                     itsa_usd = 0
-
 
             yta_tokens = result["yta"] / (10 ** result["yta_decimals"])
 
             result["liquidity_usd"] = itsa_usd
             result["token_amount"] = yta_tokens
-            result["launch_price_usd"] = (
-                round(itsa_usd / yta_tokens, 8) if yta_tokens > 0 else 0
+            result["launch_price_usd"] = round(itsa_usd / yta_tokens, 8) if yta_tokens > 0 else 0
+
+            logger.debug(
+                f"🧪 Liquidity calc for {token_mint} | itsa: {result['itsa']} "
+                f"| yta: {result['yta']} | USD: {result.get('liquidity_usd', 0)}"
             )
-            logger.debug(f"🧪 Liquidity calc for {token_mint} | itsa: {result['itsa']} | yta: {result['yta']} | USD: {result.get('liquidity_usd', 0)}")
+
         return result
     # helper free version of liquidity and estmiated
     def analyze_liquidty(self, logs: list[str], token_mint: str, dex: str, transaction):
         if dex.lower() == "raydium":
-            liquidity_data = self.parse__raydium_liquidity_logs(logs, token_mint)
+            liquidity_data = self.parse__raydium_liquidity_logs(logs, token_mint, transaction)
         elif dex.lower() == "pumpfun":
             liquidity_data = self.parse__pumpfun_liquidity_logs(logs, token_mint, transaction)
         else:

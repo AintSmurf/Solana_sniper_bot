@@ -1,4 +1,6 @@
 BOT_SETTINGS = {
+    #UI mode
+    "UI_MODE":False,
     # Minimum liquidity required (in USD) to consider a token worth evaluating/trading
     "MIN_TOKEN_LIQUIDITY": 1500,
 
@@ -18,7 +20,7 @@ BOT_SETTINGS = {
     "TP": 4.0,
 
     # Stop loss multiplier — e.g., 0.95 means -5% from entry price
-    "SL": 0.5,
+    "SL": 0.8,
 
     # Rate limiting configuration for different APIs to avoid throttling or bans
     "RATE_LIMITS": {

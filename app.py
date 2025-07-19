@@ -9,6 +9,7 @@ from helpers.rate_limiter import RateLimiter
 from config.bot_settings import BOT_SETTINGS
 from helpers.framework_manager import validate_bot_settings
 from helpers.trade_counter import TradeCounter
+from interface.main_window import SniperBotUI
 
 # set up logger
 logger = LoggingHandler.get_logger()
@@ -18,83 +19,86 @@ discord_bot = Discord_Bot()
 def start_discord_bot():
     asyncio.run(discord_bot.run())
 
-def main():
-    
-    #Events to control shutdown
+def start_bot(trade_counter):
     stop_ws = threading.Event()
     stop_fetcher = threading.Event()
     stop_tracker = threading.Event()
     stop_retry = threading.Event()
 
-    # Trade counter setup
-    trade_counter = TradeCounter(BOT_SETTINGS["MAXIMUM_TRADES"])
-    
-    # Use shared rate limiter from config
-    helius_rl_settings = BOT_SETTINGS["RATE_LIMITS"]["helius"]
-    shared_helius_limiter = RateLimiter(
-        min_interval=helius_rl_settings["min_interval"],
-        jitter_range=helius_rl_settings["jitter_range"]
+    # Setup shared rate limiter
+    helius_rl = BOT_SETTINGS["RATE_LIMITS"]["helius"]
+    helius_limiter = RateLimiter(
+        min_interval=helius_rl["min_interval"],
+        jitter_range=helius_rl["jitter_range"]
     )
 
-    # Init components Helius
     helius_connector = HeliusConnector(
-        rate_limiter=shared_helius_limiter,
+        rate_limiter=helius_limiter,
         trade_counter=trade_counter,
         stop_ws=stop_ws,
         stop_fetcher=stop_fetcher
     )
-    
-    # Init components Tracker
+
     tracker = OpenPositionTracker(
         tp=BOT_SETTINGS["TP"],
         sl=BOT_SETTINGS["SL"],
-        rate_limiter=shared_helius_limiter
+        rate_limiter=helius_limiter
     )
 
-    # Launch threads
     threading.Thread(target=helius_connector.start_ws, daemon=True).start()
-    logger.info("🚀 WebSocket Started")
-
     threading.Thread(target=helius_connector.run_transaction_fetcher, daemon=True).start()
-    logger.info("✅ Transaction fetcher started")
-
     threading.Thread(target=tracker.track_positions, args=(stop_tracker,), daemon=True).start()
-    logger.info("✅ Position tracker started")
-
     threading.Thread(target=tracker.retry_failed_sells, args=(stop_retry,), daemon=True).start()
-    logger.info("🔄 Sell retry thread started")
-
     threading.Thread(target=start_discord_bot, daemon=True).start()
-    logger.info("✅ Discord bot started")
 
-    # Keep main thread alive
-    while True:
-        time.sleep(5)
+    logger.info("🚀 All threads started")
+    return stop_ws, stop_fetcher, stop_tracker, stop_retry, tracker
 
-        if trade_counter.reached_limit():
-            # Stage 1: Stop trade-related threads
-            if not stop_ws.is_set():
-                logger.warning("🚫 MAXIMUM_TRADES reached — stopping trade threads.")
-                stop_ws.set()
-                stop_fetcher.set()
+def main():
+    validate_bot_settings()
+    trade_counter = TradeCounter(BOT_SETTINGS["MAXIMUM_TRADES"])
+    stop_ws, stop_fetcher, stop_tracker, stop_retry, tracker = start_bot(trade_counter)
 
-            # Stage 2: Stop tracker threads once work is done
-            if not tracker.has_open_positions() and not tracker.has_failed_sells():
-                logger.info("✅ All trades completed and positions cleared. Stopping all threads.")
-                stop_tracker.set()
-                stop_retry.set()
-                try:
-                    asyncio.run(discord_bot.shutdown())
-                except Exception as e:
-                    logger.warning(f"⚠️ Failed to shut down Discord bot cleanly: {e}")
-                break
+    if BOT_SETTINGS["UI_MODE"]:
+        # 👀 GUI mode — launch interface and wait for user to close it
+        app = SniperBotUI(trade_counter)
+        app.mainloop()
 
-    logger.info("🛑 Bot shutdown complete.")
+        # After UI is closed
+        stop_ws.set()
+        stop_fetcher.set()
+        stop_tracker.set()
+        stop_retry.set()
+        try:
+            asyncio.run(discord_bot.shutdown())
+        except Exception as e:
+            logger.warning(f"⚠️ Discord bot shutdown failed: {e}")
+
+    else:
+        # ⌨️ Terminal mode — loop until shutdown
+        while True:
+            time.sleep(5)
+            if trade_counter.reached_limit():
+                if not stop_ws.is_set():
+                    logger.warning("🚫 MAX TRADES hit — stopping trade threads.")
+                    stop_ws.set()
+                    stop_fetcher.set()
+                if not tracker.has_open_positions() and not tracker.has_failed_sells():
+                    logger.info("✅ Trades done — shutting everything down.")
+                    stop_tracker.set()
+                    stop_retry.set()
+                    try:
+                        asyncio.run(discord_bot.shutdown())
+                    except Exception as e:
+                        logger.warning(f"⚠️ Discord bot shutdown failed: {e}")
+                    break
+
+    logger.info("🛑 Bot fully shutdown.")
     exit(0)
+
 
 if __name__ == "__main__":
     try:
-        validate_bot_settings()
         main()
     except Exception as e:
         logger.error(f"❌ BOT_SETTINGS validation failed: {e}")
