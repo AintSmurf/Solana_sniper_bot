@@ -16,13 +16,15 @@ logger = LoggingHandler.get_logger()
 class Discord_Bot:
     def __init__(self):
         self.credentials_utility = CredentialsUtility()
-        self.token = self.credentials_utility.get_discord_token()
+        self.token = None  # Delay token loading
+
         intents = discord.Intents.default()
         intents.message_content = True
         self.bot = commands.Bot(command_prefix="!", intents=intents)
-        self.bot_ready = asyncio.Event()  # ✅ Async event for bot readiness
-        self.excel_utility = ExcelUtility()  # ✅ Initialize Excel utility
-        self.last_row_counts = {}  # ✅ Track last processed row count per file
+        self.bot_ready = asyncio.Event()
+        
+        self.excel_utility = None  # Delay ExcelUtility init
+        self.last_row_counts = {}
 
         @self.bot.event
         async def on_ready():
@@ -136,8 +138,10 @@ class Discord_Bot:
 
         except Exception as e:
             logger.error(f"❌ Error processing {filename}: {e}")
-
+    
     async def run(self):
+        self.token = self.credentials_utility.get_discord_token() 
+        self.excel_utility = ExcelUtility()  
         asyncio.create_task(self.watch_excel_for_updates())
         await self.bot.start(self.token["DISCORD_TOKEN"])
 

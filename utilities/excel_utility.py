@@ -45,7 +45,7 @@ class ExcelUtility:
                 logger.warning(f"⚠️ Token {token_mint} not found in {filepath}")
         except Exception as e:
             logger.error(f"❌ Failed to remove token from {filepath}: {e}")
-    def load_closed_positions(self, simulated=False):
+    def load_closed_positions(self, simulated):
         filename = "simulated_closed_positions.csv" if simulated else "closed_positions.csv"
         filepath = os.path.join(self.BOUGHT_TOKENS, filename)
 

@@ -7,7 +7,7 @@ from datetime import datetime
 from helpers.solana_manager import SolanaHandler
 from helpers.rate_limiter import RateLimiter
 import threading
-from config.bot_settings import BOT_SETTINGS
+from config.settings import load_settings
 
 logger = LoggingHandler.get_logger()
 tracker_logger = LoggingHandler.get_named_logger("tracker")
@@ -15,9 +15,12 @@ tracker_logger = LoggingHandler.get_named_logger("tracker")
 
 
 class OpenPositionTracker:
-    def __init__(self, tp: float, sl: float,rate_limiter: RateLimiter):
-        self.tp = tp
-        self.sl = sl
+    def __init__(self,rate_limiter: RateLimiter):
+        BOT_SETTINGS = load_settings()
+        self.tp = BOT_SETTINGS["TP"]
+        self.sl = BOT_SETTINGS["TRAILING_STOP"]
+        self.emergency_sl = BOT_SETTINGS["SL"]
+        self.min_tsl_trigger = BOT_SETTINGS["MIN_TSL_TRIGGER_MULTIPLIER"]
         self.excel_utility = ExcelUtility()
         self.solana_manager = SolanaHandler(rate_limiter)
         self.running = True
@@ -32,8 +35,10 @@ class OpenPositionTracker:
         if BOT_SETTINGS["SIM_MODE"]:
             self.file_path = os.path.join(self.excel_utility.BOUGHT_TOKENS, "simulated_tokens.csv")
 
-    def track_positions(self,stop_event):
+    def track_positions(self, stop_event):
         logger.info("📚 Starting to track open positions from Excel...")
+
+        self.peak_price_dict = {}
 
         while not stop_event.is_set() or self.has_open_positions():
             if not os.path.exists(self.file_path):
@@ -48,7 +53,7 @@ class OpenPositionTracker:
                     time.sleep(5)
                     continue
 
-                required_columns = {"Token_bought", "Token_sold", "Quote_Price", "type", "Real_Entry_Price"}
+                required_columns = {"Token_bought", "Token_sold", "Quote_Price", "type", "Real_Entry_Price", "Timestamp"}
                 if not required_columns.issubset(df.columns):
                     logger.info("📄 File exists but missing expected columns — waiting...")
                     time.sleep(1)
@@ -58,7 +63,6 @@ class OpenPositionTracker:
                 token_mints = df["Token_bought"].dropna().tolist()
                 mints = list(set(token_mints + [self.base_token]))
 
-                # If only one token is tracked (besides SOL), fetch both prices individually
                 if len(mints) == 2:
                     try:
                         token_price = self.solana_manager.get_token_price(token_mints[0])
@@ -88,20 +92,27 @@ class OpenPositionTracker:
                         buy_price_sol = float(row["Real_Entry_Price"] if not pd.isna(row["Real_Entry_Price"]) else row["Quote_Price"])
                         buy_price_usd = buy_price_sol * sol_price_usd
 
-                    # ✅ Current token price from Jupiter is in USD
                     current_price_usd = float(price_data[token_mint]["price"])
-
-                    # ✅ Compute TP/SL in USD
-                    take_profit_price = buy_price_usd * self.tp
-                    stop_loss_price = buy_price_usd * self.sl
-
                     change = ((current_price_usd - buy_price_usd) / buy_price_usd) * 100
 
-                    logger.info(
-                        f"🔎 Tracking {token_mint}... Buy: ${buy_price_usd:.10f}, Current: ${current_price_usd:.10f}, TP: ${take_profit_price:.10f}, SL: ${stop_loss_price:.10f}, Change: {change:.2f}%"
-                    )
-                    tracker_logger.info(f"🔎 Tracking {token_mint}... Buy: ${buy_price_usd:.10f}, Current: ${current_price_usd:.10f}, TP: ${take_profit_price:.10f}, SL: ${stop_loss_price:.10f}, Change: {change:.2f}%")
+                    # Update peak price
+                    if token_mint not in self.peak_price_dict:
+                        self.peak_price_dict[token_mint] = current_price_usd
+                    if current_price_usd > self.peak_price_dict[token_mint]:
+                        self.peak_price_dict[token_mint] = current_price_usd
 
+                    peak_price = self.peak_price_dict[token_mint]
+                    trailing_stop = peak_price * (1 - self.sl)
+                    take_profit_price = buy_price_usd * self.tp
+
+                    logger.info(
+                        f"🔎 Tracking {token_mint}... Buy: ${buy_price_usd:.10f}, Current: ${current_price_usd:.10f}, Peak: ${peak_price:.10f}, TP: ${take_profit_price:.10f}, TSL: ${trailing_stop:.10f}, Change: {change:.2f}%"
+                    )
+                    tracker_logger.info(
+                        f"🔎 Tracking {token_mint}... Buy: ${buy_price_usd:.10f}, Current: ${current_price_usd:.10f}, Peak: ${peak_price:.10f}, TP: ${take_profit_price:.10f}, TSL: ${trailing_stop:.10f}, Change: {change:.2f}%"
+                    )
+
+                    # --- Take Profit ---
                     if current_price_usd >= take_profit_price:
                         logger.info(f"🎯 TAKE PROFIT triggered for {token_mint}!")
                         tracker_logger.info(f"🎯 TAKE PROFIT triggered for {token_mint}!")
@@ -111,15 +122,44 @@ class OpenPositionTracker:
                             self.sell_and_update(token_mint, input_mint, trigger="TP")
                         continue
 
-                    if current_price_usd <= stop_loss_price:
-                        logger.info(f"🚨 STOP LOSS triggered for {token_mint}!")
-                        tracker_logger.info(f"🚨 STOP LOSS triggered for {token_mint}!")
+                    # --- Trailing Stop Loss ---
+                    has_pumped = peak_price >= buy_price_usd * self.min_tsl_trigger
+                    if has_pumped and current_price_usd <= trailing_stop:
+                        logger.info(f"🪂 TRAILING STOP LOSS triggered for {token_mint}!")
+                        tracker_logger.info(f"🪂 TRAILING STOP LOSS triggered for {token_mint}!")
+                        if row["type"] == "SIMULATED_BUY":
+                            self.simulated_sell_and_log(row, current_price_usd, trigger="TSL")
+                        else:
+                            self.sell_and_update(token_mint, input_mint, trigger="TSL")
+                        continue
+                    
+                    # --- Emergency Stop Loss (if no pump and dumped hard)
+                    emergency_stop = buy_price_usd * (1 - self.emergency_sl)
+
+                    if not has_pumped and current_price_usd <= emergency_stop:
+                        logger.warning(f"💀 EMERGENCY SL triggered for {token_mint}!")
+                        tracker_logger.warning(f"💀 EMERGENCY SL triggered for {token_mint}!")
                         if row["type"] == "SIMULATED_BUY":
                             self.simulated_sell_and_log(row, current_price_usd, trigger="SL")
                         else:
                             self.sell_and_update(token_mint, input_mint, trigger="SL")
                         continue
 
+
+                    # --- Timeout (No Pump in 30s) ---
+                    try:
+                        buy_time = datetime.strptime(row["Timestamp"], "%Y-%m-%d %H:%M:%S")
+                        seconds_since_buy = (datetime.now() - buy_time).total_seconds()
+                        if seconds_since_buy > 30 and current_price_usd < buy_price_usd * 1.05:
+                            logger.info(f"⌛ TIMEOUT triggered for {token_mint} (no pump in 30s) — exiting.")
+                            tracker_logger.info(f"⌛ TIMEOUT triggered for {token_mint} — exiting.")
+                            if row["type"] == "SIMULATED_BUY":
+                                self.simulated_sell_and_log(row, current_price_usd, trigger="TIMEOUT")
+                            else:
+                                self.sell_and_update(token_mint, input_mint, trigger="TIMEOUT")
+                            continue
+                    except Exception as e:
+                        logger.warning(f"⚠️ Could not parse Timestamp for timeout check: {e}")
 
                 with self.tokens_lock:
                     if self.tokens_to_remove:
@@ -132,7 +172,7 @@ class OpenPositionTracker:
                 logger.error(f"❌ Error in OpenPositionTracker: {e}")
 
             time.sleep(0.25)
-    
+
     def sell_and_update(self, token_mint, input_mint, trigger=None):
         try:
             result = self.solana_manager.sell(token_mint, input_mint)
@@ -176,9 +216,9 @@ class OpenPositionTracker:
             data = {
                 "Timestamp": [datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
                 "Token Mint": [token_mint],
-                "Entry_USD": [entry_price_usd],
-                "Exit_USD": [executed_price_usd],
-                "PnL (%)": [round(pnl, 2)],
+                "Entry_USD": [f"{entry_price_usd:.8f}"],
+                "Exit_USD": [f"{executed_price_usd:.8f}"],
+                "PnL (%)": [f"{pnl:.2f}"],
                 "Sell_Signature": [signature],
                 "Buy_Signature": [matched_row.iloc[0].get("Signature", "")],
                 "Type": ["SOLD"],

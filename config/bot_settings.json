@@ -1,0 +1,29 @@
+{
+    "UI_MODE": true,
+    "MIN_TOKEN_LIQUIDITY": 10000,
+    "MAX_TOKEN_AGE_SECONDS": 30,
+    "TRADE_AMOUNT": 10,
+    "MAXIMUM_TRADES": 20,
+    "SIM_MODE": true,
+    "TP": 4.0,
+    "SL": 0.25,
+    "TRAILING_STOP": 0.2,
+    "MIN_TSL_TRIGGER_MULTIPLIER": 1.5,
+    "RATE_LIMITS": {
+        "helius": {
+            "min_interval": 0.02,
+            "jitter_range": [
+                0.005,
+                0.01
+            ]
+        },
+        "jupiter": {
+            "min_interval": 1.1,
+            "jitter_range": [
+                0.05,
+                0.15
+            ],
+            "max_requests_per_minute": 60
+        }
+    }
+}

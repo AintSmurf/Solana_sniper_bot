@@ -14,7 +14,7 @@ from collections import deque
 from utilities.rug_check_utility import RugCheckUtility
 import threading
 from config.dex_detection_rules import DEX_DETECTION_RULES
-from config.bot_settings import BOT_SETTINGS
+from config.settings import get_bot_settings
 from config.blacklist import BLACK_LIST
 from helpers.trade_counter import TradeCounter
 
@@ -32,6 +32,7 @@ signature_to_token_mint = {}
 
 
 known_tokens = set()
+BOT_SETTINGS = get_bot_settings()
 MAX_TOKEN_AGE_SECONDS = BOT_SETTINGS["MAX_TOKEN_AGE_SECONDS"]
 MIN_TOKEN_LIQUIDITY = BOT_SETTINGS["MIN_TOKEN_LIQUIDITY"]
 TRADE_AMOUNT=BOT_SETTINGS["TRADE_AMOUNT"]
@@ -309,7 +310,6 @@ class HeliusConnector:
                 return
             signature_cache.append(signature)  
             logger.info(f"✅ Passed Step 1: Mint instruction found in {signature}.")
-
             # Step 2: Ignore duplicates from queue
             if signature in signature_queue:
                 logger.debug(f"⏩ Ignoring duplicate signature from queue: {signature}")
@@ -396,7 +396,7 @@ class HeliusConnector:
             )
 
             if "result" in response and response["result"]:
-                first_tx = response["result"][-1]
+                first_tx = response["result"][0]
                 if "blockTime" in first_tx and first_tx["blockTime"]:
                     return int(time.time()) - int(first_tx["blockTime"])
         except Exception as e:
@@ -481,9 +481,3 @@ class HeliusConnector:
     def _start_detection_timer(self, token_mint: str):
         if token_mint not in self.transaction_timers:
             self.transaction_timers[token_mint] = time.time()
-
-    def _get_token_age(self, token_mint: str) -> float | None:
-        start = self.transaction_timers.get(token_mint)
-        if start is None:
-            return None
-        return time.time() - start

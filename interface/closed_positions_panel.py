@@ -2,10 +2,12 @@ import tkinter as tk
 from tkinter import ttk
 import pandas as pd
 from interface.styling import *
+from config.settings import load_settings
 
 class ClosedPositionsPanel(tk.Frame):
     def __init__(self, parent, excel_utility=None, **kwargs):
         super().__init__(parent, **kwargs)
+        self.settings = load_settings()
         kwargs.setdefault("bg", BG_COLOR)
         self.excel_utility = excel_utility
 
@@ -58,5 +60,5 @@ class ClosedPositionsPanel(tk.Frame):
             ))
 
     def refresh(self):
-        df = self.excel_utility.load_closed_positions()
+        df = self.excel_utility.load_closed_positions(self.settings["SIM_MODE"])
         self.update_table(df)

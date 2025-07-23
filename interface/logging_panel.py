@@ -2,11 +2,19 @@ import tkinter as tk
 from interface.styling import *
 from datetime import datetime
 import queue
+import re
+
+# Regex to parse tracking logs
+TRACK_RE = re.compile(
+    r"Tracking\s+([A-Za-z0-9]+).*?Buy:\s*\$([0-9.eE+-]+).*?Current:\s*\$([0-9.eE+-]+).*?Peak:\s*\$([0-9.eE+-]+).*?TP:\s*\$([0-9.eE+-]+).*?TSL:\s*\$([0-9.eE+-]+).*?Change:\s*([-\d.]+)%",
+    re.IGNORECASE,
+)
 
 class LoggingPanel(tk.Frame):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         kwargs.setdefault("bg", BG_COLOR)
+
         # Scrollable Text Widget
         self._logging_text = tk.Text(
             self,
@@ -30,15 +38,49 @@ class LoggingPanel(tk.Frame):
         self.queue = queue.Queue()
         self.after(100, self._poll_queue)
 
-    def add_log(self, level: str, source: str, lineno: int, message: str):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
-        log_line = f"{timestamp} - {level.upper():<5} - {source}:{lineno} - {message}\n"
-        self.queue.put(log_line)
+    def add_log(self, msg: str):
+        """Add a log message (thread-safe if needed)."""
+        clean_msg = msg.strip()
+        if "Tracking" in clean_msg:
+            clean_msg = self._format_tracking_message(clean_msg)
+        clean_msg += "\n"
+
+        self._logging_text.configure(state=tk.NORMAL)
+        self._logging_text.insert("end", clean_msg)
+        self._logging_text.see("end")
+        self._logging_text.configure(state=tk.DISABLED)
+
+    def queue_put(self, msg: str):
+        self.queue.put(msg)
+
+    def _insert_text(self, msg: str):
+        clean_msg = msg.strip()
+        if "Tracking" in clean_msg:
+            clean_msg = self._format_tracking_message(clean_msg)
+        clean_msg += "\n"
+
+        self._logging_text.configure(state=tk.NORMAL)
+        self._logging_text.insert("end", clean_msg)
+        self._logging_text.see("end")
+        self._logging_text.configure(state=tk.DISABLED)
 
     def _poll_queue(self):
         while not self.queue.empty():
             msg = self.queue.get()
-            self._logging_text.configure(state=tk.NORMAL)
-            self._logging_text.insert("1.0", msg)
-            self._logging_text.configure(state=tk.DISABLED)
+            self._insert_text(msg)
         self.after(100, self._poll_queue)
+
+    def _format_tracking_message(self, msg: str) -> str:
+        match = TRACK_RE.search(msg)
+        if not match:
+            return msg  # fallback if parsing fails
+
+        token, tp, tsl, change = match.groups()
+
+        # Compact single-line formatting
+        return (f"[{datetime.now().strftime('%H:%M:%S')}] "
+                f"🔎 {token:<12}  "
+                f"TP: {float(tp):<10.8f}  "
+                f"TSL: {float(tsl):<10.8f}  "
+                f"Change: {change}%")
+

@@ -1,6 +1,5 @@
 import os
 import json
-from config.bot_settings import BOT_SETTINGS
 from datetime import datetime, timezone,timedelta
 
 
@@ -16,27 +15,26 @@ def get_payload(file) -> json:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def validate_bot_settings():
-
-    if not isinstance(BOT_SETTINGS["MIN_TOKEN_LIQUIDITY"], (int, float)):
+def validate_bot_settings(settings):
+    if not isinstance(settings["MIN_TOKEN_LIQUIDITY"], (int, float)):
         raise TypeError("MIN_TOKEN_LIQUIDITY must be a number")
 
-    if not isinstance(BOT_SETTINGS["MAX_TOKEN_AGE_SECONDS"], int):
+    if not isinstance(settings["MAX_TOKEN_AGE_SECONDS"], int):
         raise TypeError("MAX_TOKEN_AGE_SECONDS must be an integer")
 
-    if not isinstance(BOT_SETTINGS["TRADE_AMOUNT"], (int, float)):
+    if not isinstance(settings["TRADE_AMOUNT"], (int, float)):
         raise TypeError("TRADE_AMOUNT must be a number")
     
-    if not isinstance(BOT_SETTINGS["SIM_MODE"], bool):
+    if not isinstance(settings["SIM_MODE"], bool):
         raise TypeError("SIM_MODE must be a bool")
 
-    if not isinstance(BOT_SETTINGS["TP"], float):
+    if not isinstance(settings["TP"], float):
         raise TypeError("TP must be a float")
 
-    if not isinstance(BOT_SETTINGS["SL"], float):
+    if not isinstance(settings["SL"], float):
         raise TypeError("SL must be a float")
 
-    rl = BOT_SETTINGS.get("RATE_LIMITS", {})
+    rl = settings.get("RATE_LIMITS", {})
     for api in ["helius", "jupiter"]:
         if api not in rl:
             raise ValueError(f"Missing RATE_LIMITS config for: {api}")

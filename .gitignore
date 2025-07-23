@@ -25,3 +25,5 @@ missed_token_analysis_checked.csv
 log_api.py
 crypto_sniper_fixed_spacing.drawio
 test.json
+backup/
+trade_count.json
