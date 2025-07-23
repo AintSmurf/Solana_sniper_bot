@@ -24,4 +24,4 @@ COPY . .
 RUN chmod +x Credentials.sh
 
 # Run: source credentials and start the bot
-CMD ["/bin/bash", "-c", "source ./local_credential.sh && python3 -u app.py"]
+CMD ["/bin/bash", "-c", "source ./local_credential.sh && python -u app.py --s"]
