@@ -3,7 +3,6 @@
 ## Overview
 
 **Solana Sniper Bot** is a high-performance, real-time trading automation tool designed to detect and evaluate newly launched tokens on the Solana blockchain. Using **Helius WebSocket logs**, the bot identifies fresh token mints (e.g. via **Raydium** or **Pump.fun**) and runs them through a rigorous anti-scam pipeline. If deemed safe, tokens are logged, optionally bought, and monitored for profit-taking or stop-loss triggers.
-
 🔧 The bot includes fully implemented **buy/sell mechanics** via Jupiter & Raydium swaps — currently under controlled testing.  
 📊 Real-time results are recorded to CSV and optionally sent to Discord.
 
