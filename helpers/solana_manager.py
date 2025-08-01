@@ -187,9 +187,6 @@ class SolanaHandler:
             logger.info(f"📦 Jupiter Quote: In = {quote['inAmount']}, Out = {quote['outAmount']}")
             quote_price = float(quote['outAmount']) / float(quote['inAmount'])
             logger.info(f"💡 Expected quote price: {quote_price:.10f}")
-
-            self.add_token_account(output_mint)
-
             #default data        
             now = datetime.now()
             date_str = now.strftime("%Y-%m-%d")
@@ -222,6 +219,10 @@ class SolanaHandler:
                 })
                 self.excel_utility.save_to_csv(self.excel_utility.BOUGHT_TOKENS, f"simulated_tokens.csv", data)
                 return "SIMULATED"
+            
+            #add token account for safety
+            self.add_token_account(output_mint)
+
 
             # 🚀 Send transaction
             txn_64 = self.get_swap_transaction(quote)

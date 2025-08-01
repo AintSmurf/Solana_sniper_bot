@@ -21,6 +21,8 @@ class OpenPositionTracker:
         self.sl = BOT_SETTINGS["TRAILING_STOP"]
         self.emergency_sl = BOT_SETTINGS["SL"]
         self.min_tsl_trigger = BOT_SETTINGS["MIN_TSL_TRIGGER_MULTIPLIER"]
+        self.timeout_limit = BOT_SETTINGS["TIMEOUT_SECONDS"]
+        self.profit_threshold = BOT_SETTINGS["TIMEOUT_PROFIT_THRESHOLD"]
         self.excel_utility = ExcelUtility()
         self.solana_manager = SolanaHandler(rate_limiter)
         self.running = True
@@ -150,7 +152,7 @@ class OpenPositionTracker:
                     try:
                         buy_time = datetime.strptime(row["Timestamp"], "%Y-%m-%d %H:%M:%S")
                         seconds_since_buy = (datetime.now() - buy_time).total_seconds()
-                        if seconds_since_buy > 30 and current_price_usd < buy_price_usd * 1.05:
+                        if seconds_since_buy > self.timeout_limit and current_price_usd < buy_price_usd * self.profit_threshold:
                             logger.info(f"⌛ TIMEOUT triggered for {token_mint} (no pump in 30s) — exiting.")
                             tracker_logger.info(f"⌛ TIMEOUT triggered for {token_mint} — exiting.")
                             if row["type"] == "SIMULATED_BUY":

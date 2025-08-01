@@ -12,6 +12,8 @@ DEFAULT_SETTINGS = {
     "TRADE_AMOUNT": 10,
     "MAXIMUM_TRADES": 20,
     "SIM_MODE": True,
+    "TIMEOUT_SECONDS": 45,
+    "TIMEOUT_PROFIT_THRESHOLD": 1.03,
 
     # Trading logic
     "TP": 4.0,                              # Take profit = 4x
@@ -32,7 +34,6 @@ DEFAULT_SETTINGS = {
         }
     }
 }
-
 
 SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "bot_settings.json")
 
