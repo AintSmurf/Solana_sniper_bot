@@ -16,6 +16,9 @@ class LoggingPanel(tk.Frame):
         self.close_trade_callback = close_trade_callback
 
         self._img_cache = {}
+        self.sold_tokens = set()
+
+        
 
         self.placeholder_img = self._load_placeholder()
         
@@ -33,7 +36,7 @@ class LoggingPanel(tk.Frame):
         self.columns = ["Logo",  "Token", "Entry Price", "Current Price", "PnL (%)","Action"]
         self.tree = ttk.Treeview(
             self,
-            columns=self.columns[1:],  # skip Logo (tree col)
+            columns=self.columns[1:],
             show="tree headings",
             style="Custom.Treeview"
         )
@@ -54,18 +57,22 @@ class LoggingPanel(tk.Frame):
         
         #make it reponsive
         self.tree.tag_configure("hover", background="#2a2a2a")
+        self.tree.tag_configure("hover_action", background="#552222", foreground="red")
         self.tree.bind("<Motion>", self._on_hover)
         self.tree.bind("<Leave>", lambda e: [self.tree.item(iid, tags=()) for iid in self.tree.get_children()])
 
 
         
         # Treeview bindings
-        self.tree.bind("<Button-1>", self._on_click)      
         self.tree.bind("<Button-3>", self._copy_selected) 
         self.tree.bind("<Control-c>", self._copy_selected) 
         self.tree.bind("<Double-1>", self._on_double_click)
         self.tree.bind("<Escape>", lambda e: self.tree.selection_remove(self.tree.selection()))
         self.tree.bind("<Button-1>", self._on_click_with_deselect, add="+")
+        self.tree.bind("<Motion>", self._on_motion, add="+")
+        self.tree.bind("<Button-1>", self._on_click, add="+")
+
+        
 
 
         style = ttk.Style()
@@ -145,13 +152,16 @@ class LoggingPanel(tk.Frame):
         img = self._load_token_logo(token, log.get("token_image"))
 
         if event == "track":
+            if token in self.sold_tokens:
+                return
             values = [
                 log.get("token_name", token),
                 f"{log.get('entry_price', 0):.8f}",
                 f"{log.get('current_price', 0):.8f}",
                 f"{log.get('pnl', 0):.2f}%",
-                "❌ Close"
+                "❌ Close" 
             ]
+
             if token in self.active_logs:
                 self.tree.item(self.active_logs[token], values=values, image=img, text="")
             else:
@@ -164,16 +174,16 @@ class LoggingPanel(tk.Frame):
                 item_id = self.active_logs.pop(token, None)
                 if item_id:
                     self.tree.delete(item_id)
+                self.sold_tokens.add(token)
                 self.all_logs.pop(token, None)
-        self._clear_queue_for_token(token)
+                self._clear_queue_for_token(token)
         self.tree.update_idletasks()
         self.apply_filter()
 
     def apply_filter(self):
-        """Filter rows by token name (case-insensitive substring)."""
         filter_text = self.filter_var.get().lower()
         for token, item_id in self.active_logs.items():
-            token_name = self.all_logs[token][1].lower() 
+            token_name = self.all_logs[token][0].lower() 
             if filter_text in token_name:
                 self.tree.reattach(item_id, "", "end")
             else:
@@ -193,25 +203,6 @@ class LoggingPanel(tk.Frame):
                 pass
             self.after_id = None
 
-    def _on_click(self, event):
-        """Detect clicks in Action column and trigger callback."""
-        item_id = self.tree.identify_row(event.y)
-        col = self.tree.identify_column(event.x)  # e.g. "#5"
-
-        if not item_id:
-            return
-
-        # Correct Action col index (Logo is #0, so shift)
-        action_index = self.columns.index("Action")  # no +1 since Logo is #0
-        if col == f"#{action_index}":
-            token = None
-            for t, iid in self.active_logs.items():
-                if iid == item_id:
-                    token = t
-                    break
-            if token and self.close_trade_callback:
-                self.close_trade_callback(token)
-        
     def _on_double_click(self, event):
         item_id = self.tree.identify_row(event.y)
         col = self.tree.identify_column(event.x)
@@ -297,9 +288,45 @@ class LoggingPanel(tk.Frame):
                 self.tree.selection_remove(rowid)
 
     def _clear_queue_for_token(self, token):
-        new_q = queue.Queue()
+        keep = []
         while not self.queue.empty():
             msg = self.queue.get()
             if not (isinstance(msg, dict) and msg.get("token_mint") == token):
-                new_q.put(msg)
-        self.queue = new_q
+                keep.append(msg)
+        for msg in keep:
+            self.queue.put(msg)
+
+    def _on_motion(self, event):
+        col = self.tree.identify_column(event.x)
+        rowid = self.tree.identify_row(event.y)
+        action_col = self._get_action_col()
+
+        # Reset all row tags
+        for iid in self.tree.get_children():
+            self.tree.item(iid, tags=())
+
+        if rowid:
+            if col == action_col:
+                self.tree.config(cursor="hand2")
+                self.tree.item(rowid, tags=("hover_action",))
+            else:
+                self.tree.config(cursor="")
+                self.tree.item(rowid, tags=("hover",))
+
+    def _on_click(self, event):
+        item_id = self.tree.identify_row(event.y)
+        col = self.tree.identify_column(event.x)
+        action_col = self._get_action_col()
+        if not item_id:
+            return
+        if col == action_col:
+            token = None
+            for t, iid in self.active_logs.items():
+                if iid == item_id:
+                    token = t
+                    break
+            if token and self.close_trade_callback:
+                self.close_trade_callback(token)
+
+    def _get_action_col(self):
+        return f"#{self.columns[1:].index('Action') + 1}"

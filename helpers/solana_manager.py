@@ -1,71 +1,72 @@
 from solana.rpc.api import Client
-from solana.rpc.types import TokenAccountOpts
 from solders.keypair import Keypair  # type: ignore
 from solders.pubkey import Pubkey  # type: ignore
 from solders.transaction import VersionedTransaction  # type: ignore
 from solders.message import MessageV0  # type: ignore
-from solders.signature import Signature  # type: ignore
-from spl.token.instructions import create_associated_token_account
-from helpers.logging_manager import LoggingHandler
-from utilities.credentials_utility import CredentialsUtility
-from utilities.requests_utility import RequestsUtility
-from utilities.excel_utility import ExcelUtility
-from spl.token.instructions import get_associated_token_address
-from config.urls import HELIUS_URL, JUPITER_STATION, RAYDIUM
+from spl.token.instructions import create_associated_token_account,get_associated_token_address
+from config.third_parties import JUPITER_STATION
+from config.network import HELIUS_URL
 import struct
 from solana.transaction import Transaction
-from config.urls import JUPITER_STATION
+from config.third_parties import JUPITER_STATION
 from helpers.framework_manager import get_payload
 import base64
 import math
-from utilities.rug_check_utility import RugCheckUtility
 import requests
 from datetime import datetime
 import re
-from helpers.rate_limiter import RateLimiter
 import time
-from config.settings import get_bot_settings
-from helpers.volume_tracker import VolumeTracker
 from spl.token.constants import TOKEN_PROGRAM_ID as SPL_TOKEN_PROGRAM_ID
 from config.dex_detection_rules import PUMPFUN_PROGRAM_ID,RAYDIUM_PROGRAM_ID,KNOWN_BASES
 import threading
-from config.settings import load_settings
+from helpers.bot_context import BotContext
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 
-# Set up logger
-logger = LoggingHandler.get_logger()
-special_logger = LoggingHandler.get_special_debug_logger()
+
 
 
 class SolanaManager:
-    def __init__(self,rate_limiter: RateLimiter):
-        self.helius_requests = RequestsUtility(HELIUS_URL["BASE_URL"])
-        credentials_utility = CredentialsUtility()
-        self.request_utility = RequestsUtility(RAYDIUM["BASE_URL"])
-        self.jupiter_requests = RequestsUtility(JUPITER_STATION["BASE_URL"])
-        self.rug_check_utility = RugCheckUtility()
-        self.excel_utility = ExcelUtility()
-        self.helius_rate_limiter = rate_limiter
-        self.settings = load_settings()
-        self.volume_tracker = VolumeTracker()
+    def __init__(self,ctx:BotContext):
+        #objects
+        self.ctx = ctx
+        self.settings = self.ctx.settings
+        self.helius_requests = self.ctx.helius_requests
+        self.jupiter_requests = self.ctx.jupiter_requests
+        self.helius_enhanced =self.ctx.helius_enhanced
+        self.rug_check_utility = self.ctx.rug_check
+        self.excel_utility = self.ctx.excel_utility
+        self.volume_tracker = self.ctx.get("volume_tracker")
+        self.notification_manager = self.ctx.get("notification_manager")
+
+        #self.logger
+        self.logger =self.ctx.logger
+        self.special_logger =self.ctx.special_logger
+
+        #rate limits        
+        self.helius_rate_limiter = self.ctx.rate_limiters["helius"]
+        self.jupiter_rate_limiter = self.ctx.rate_limiters["jupiter"]
+
         self.prepare_json_files()
-        BOT_SETTINGS = get_bot_settings()
-        jupiter_rl_settings = BOT_SETTINGS["RATE_LIMITS"]["jupiter"]
-        self.jupiter_rate_limiter = RateLimiter(min_interval=jupiter_rl_settings["min_interval"],jitter_range=tuple(jupiter_rl_settings["jitter_range"]),max_requests_per_minute=jupiter_rl_settings["max_requests_per_minute"],name=jupiter_rl_settings["name"])
-        self.api_key = credentials_utility.get_helius_api_key()
-        self._private_key_solana = credentials_utility.get_solana_private_wallet_key()
-        self.bird_api_key = credentials_utility.get_bird_eye_key()
-        self.url = HELIUS_URL["BASE_URL"] + self.api_key["HELIUS_API_KEY"]
+        #environmint variblies
+        self.api_key = self.ctx.api_keys["helius"]
+        self._private_key_solana = self.ctx.api_keys["wallet_key"]
+        self.bird_api_key = self.ctx.api_keys["bird_eye"]
+
+        #wallet
+        self.logger.info("Initializing wallet solana manager class...") 
+        self.url = HELIUS_URL[self.ctx.settings["NETWORK"]] + self.api_key
         self.client = Client(self.url, timeout=30)
-        self.keypair = Keypair.from_base58_string(
-            self._private_key_solana["SOLANA_PRIVATE_KEY"]
-        )
+        self.keypair = Keypair.from_base58_string(self._private_key_solana)
         self.wallet_address = self.keypair.pubkey()
-        logger.debug(
+        self.logger.debug(
             f"Initialized TransactionHandler with wallet: {self.wallet_address}"
         )
         self.id = 1
+
+        #local instances
+        self.slippage = float(self.settings["SLPG"])
         self._cached_sol_price = None
         self._last_sol_fetch = 0
         self._sol_cache_ttl = 5
@@ -80,9 +81,13 @@ class SolanaManager:
         self.largest_accounts_payload = get_payload("Largets_accounts")
         self.program_accounts = get_payload("Liquidity_payload")
         self.token_account_by_owner = get_payload("Token_account_by_owner")
+        self.transaction_payload = get_payload("Transaction")
+        self.signature_for_adress = get_payload("Signature_for_adress")
+        self.block_time_payload = get_payload("Blocktime_payload")
+        self.helius_multiple_transactions = get_payload("Enhanced transactions")
 
     def get_account_balances(self) -> list:
-        logger.debug(f"Fetching token balances for wallet: {self.wallet_address}")
+        self.logger.debug(f"Fetching token balances for wallet: {self.wallet_address}")
 
         try:
             # Call your existing Helius wrapper
@@ -101,7 +106,7 @@ class SolanaManager:
                         "balance": balance
                     })
                 except Exception as inner_e:
-                    logger.error(f"❌ Error processing token account {acc}: {inner_e}")
+                    self.logger.error(f"❌ Error processing token account {acc}: {inner_e}")
 
             # Add SOL balance
             try:
@@ -109,23 +114,23 @@ class SolanaManager:
                 sol_balance = sol_balance_response.value / (10 ** 9)
                 token_balances.insert(0, {"token_mint": "SOL", "balance": sol_balance})
             except Exception as sol_e:
-                logger.warning(f"⚠️ Could not fetch SOL balance: {sol_e}")
+                self.logger.warning(f"⚠️ Could not fetch SOL balance: {sol_e}")
 
             # Optionally filter out zero balances
             token_balances = [b for b in token_balances if b["balance"] > 0]
 
-            logger.info(f"✅ Retrieved {len(token_balances)} token balances.")
-            logger.debug(f"Token Balances: {token_balances}")
+            self.logger.info(f"✅ Retrieved {len(token_balances)} token balances.")
+            self.logger.debug(f"Token Balances: {token_balances}")
 
             return token_balances
 
         except Exception as e:
-            logger.error(f"❌ Failed to fetch balances: {e}")
+            self.logger.error(f"❌ Failed to fetch balances: {e}")
             return []
 
     def add_token_account(self, token_mint: str):
         """Ensure the wallet has an Associated Token Account (ATA) for a given token."""
-        logger.debug(f"Checking token account for mint: {token_mint}")
+        self.logger.debug(f"Checking token account for mint: {token_mint}")
 
         try:
             token_mint_pubkey = Pubkey.from_string(token_mint)
@@ -133,19 +138,17 @@ class SolanaManager:
                 owner=self.wallet_address, mint=token_mint_pubkey
             )
 
-            # Check if the account already exists
             response = self.client.get_account_info(associated_token_account)
-            logger.debug(f"Token Account Lookup Response: {response}")
+            self.logger.debug(f"Token Account Lookup Response: {response}")
 
             if response.value:
-                logger.info(
+                self.logger.info(
                     f"✅ Token account already exists: {associated_token_account}"
                 )
                 return associated_token_account
 
-            logger.info(f"Creating new token account for mint: {token_mint}")
+            self.logger.info(f"Creating new token account for mint: {token_mint}")
 
-            # ✅ Use the idempotent function to create an ATA if it doesn't exist
             transaction = Transaction()
             transaction.add(
                 create_associated_token_account(
@@ -155,66 +158,71 @@ class SolanaManager:
                 )
             )
 
-            # Fetch latest blockhash
             blockhash_resp = self.client.get_latest_blockhash()
             recent_blockhash = blockhash_resp.value.blockhash
 
-            # Convert to MessageV0 and Sign
             message = MessageV0.try_compile(
                 self.wallet_address, transaction.instructions, [], recent_blockhash
             )
             versioned_txn = VersionedTransaction(message, [self.keypair])
 
-            # Send the transaction to create the token account
             send_response = self.client.send_transaction(versioned_txn)
 
             if send_response.value:
-                logger.info(f"✅ Token account created: {associated_token_account}")
-                logger.debug(f"Transaction Signature: {send_response.value}")
+                self.logger.info(f"✅ Token account created: {associated_token_account}")
+                self.logger.debug(f"Transaction Signature: {send_response.value}")
                 return associated_token_account
             else:
-                logger.warning(
+                self.logger.warning(
                     f"⚠️ Token account creation might have failed: {send_response}"
                 )
                 return None
 
         except Exception as e:
-            logger.error(f"❌ Failed to create token account: {e}")
+            self.logger.error(f"❌ Failed to create token account: {e}")
             return None
 
     def buy(self, input_mint: str, output_mint: str, usd_amount: int, sim: bool = False) -> str:
 
-        logger.info(f"🔄 Initiating buy for ${usd_amount} — Token: {output_mint}")
+        self.logger.info(f"🔄 Initiating buy for ${usd_amount} — Token: {output_mint}")
         try:
             token_amount = self.get_solana_token_worth_in_dollars(usd_amount)       
-            quote = self.get_quote(input_mint, output_mint, token_amount,self.settings["SLPG"])
+            quote = self.get_quote(input_mint, output_mint, token_amount,self.slippage)
             if not quote:
-                logger.warning("⚠️ No quote received, aborting buy.")
+                self.logger.warning("⚠️ No quote received, aborting buy.")
                 return None
 
-            logger.info(f"📦 Jupiter Quote: In = {quote['inAmount']}, Out = {quote['outAmount']}")
-            quote_price = float(quote['outAmount']) / float(quote['inAmount'])
-            logger.info(f"💡 Expected quote price: {quote_price:.10f}")
+            self.logger.info(f"📦 Jupiter Quote for{output_mint}: In = {quote['inAmount']}, Out = {quote['outAmount']}")
+            
+            input_decimals = self.get_token_decimals(input_mint)
+            output_decimals = self.get_token_decimals(output_mint)
+
+            normalized_in = float(quote["inAmount"]) / (10 ** input_decimals)
+            normalized_out = float(quote["outAmount"]) / (10 ** output_decimals)
+
+            quote_price = normalized_out / normalized_in
+
+            self.logger.info(f"💡 Expected quote price for{output_mint}: {quote_price:.10f}")
             
             #default data        
             now = datetime.now()
+            timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
             date_str = now.strftime("%Y-%m-%d")
-            time_str = now.strftime("%H:%M:%S")
 
             data = {
-                "Timestamp": [f"{date_str} {time_str}"],
+                "Buy_Timestamp": [timestamp_str],
                 "Quote_Price": [quote_price],
                 "Token_sold": [input_mint],
                 "Token_bought": [output_mint],
             }
-            if sim:
-                token_decimals = self.get_token_decimals(output_mint)
-                token_received = float(quote["outAmount"]) / (10 ** token_decimals)
-                if token_received == 0:
-                    logger.warning(f"❌ Quote gives 0 tokens, skipping simulation for {output_mint}")
-                    return None
+            token_decimals = self.get_token_decimals(output_mint)
+            token_received = float(quote["outAmount"]) / (10 ** token_decimals)
+            if token_received == 0:
+                self.logger.warning(f"❌ Quote gives 0 tokens, skipping simulation for {output_mint}")
+                return None
 
-                real_entry_price = usd_amount / token_received  
+            real_entry_price = usd_amount / token_received 
+            if sim: 
 
                 data.update({
                     "type": ["SIMULATED_BUY"],
@@ -226,7 +234,8 @@ class SolanaManager:
                     "Signature": ["SIMULATED"],
                     "Entry_USD": [real_entry_price], 
                 })
-                self.excel_utility.save_to_csv(self.excel_utility.BOUGHT_TOKENS, f"simulated_tokens.csv", data)
+                self.excel_utility.save_to_csv(self.excel_utility.NOTIFICATIONS, f"discord_{date_str}.csv", data)
+                self.excel_utility.save_to_csv(self.excel_utility.OPEN_POISTIONS, f"simulated_tokens_{date_str}.csv", data)
                 return "SIMULATED"
 
 
@@ -237,40 +246,45 @@ class SolanaManager:
             self.id += 1
             self.helius_rate_limiter.wait()
             response = self.helius_requests.post(
-                self.api_key["HELIUS_API_KEY"], payload=self.send_transaction_payload
+                self.api_key, payload=self.send_transaction_payload
             )
-            logger.debug(f"Buy response: {response}")
-
+            self.logger.debug(f"Buy response: {response}")
+            
+            
+            buy_signature = response.get("result", None)
             if "result" not in response:
-                logger.warning(f"❌ Buy FAILED for {output_mint}: {response['error'].get('message')}")
+                self.logger.warning(f"❌ Buy FAILED for {output_mint}: {response['error'].get('message')}")
                 data.update({
                     "type": ["FAILED_BUY"],
                     "Error_Code": [response["error"]["code"]],
                     "Error_Message": [response["error"]["message"]],
                 })
-                self.excel_utility.save_to_csv(self.excel_utility.BOUGHT_TOKENS, f"failed_buys_{date_str}.csv", data)
+                self.excel_utility.save_to_csv(self.excel_utility.FAILED_TOKENS, f"failed_buys_{date_str}.csv", data)
                 return None
+            threading.Thread(
+                target=self.verify_signature,
+                args=(buy_signature, data, date_str, output_mint, "BUY"),
+                daemon=True
+            ).start()
 
-            logger.info(f"✅ Buy SUCCESSFUL for {output_mint}")
-            buy_signature = response.get("result", None)
+            self.logger.info(f"✅ Buy SUCCESSFUL for {output_mint}")
 
-            # Start tracking immediately with quote_price (approx)
-            real_entry_price = quote_price
+
             data.update({
                 "Real_Entry_Price": [real_entry_price],
                 "Entry_USD": [real_entry_price],
-                "Token_Received": [0],  # will update later
+                "Token_Received": [token_received],
                 "WSOL_Spent": [usd_amount / self.get_sol_price()],
-                "type": ["BUY"],
+                "type": ["PENDING"],
                 "Sold_At_Price": [0],
                 "SentToDiscord": [False],
                 "Signature": [buy_signature],
             })
 
             # Save instantly so tracker can pick it up
-            self.excel_utility.save_to_csv(self.excel_utility.BOUGHT_TOKENS, f"bought_tokens_{date_str}.csv", data)
-            self.excel_utility.save_to_csv(self.excel_utility.BOUGHT_TOKENS, "open_positions.csv", data)
-            self.excel_utility.save_to_csv(self.excel_utility.BOUGHT_TOKENS, f"discord_{date_str}.csv", data)
+            self.excel_utility.save_to_csv(self.excel_utility.OPEN_POISTIONS, f"bought_tokens_{date_str}.csv", data)
+            self.excel_utility.save_to_csv(self.excel_utility.OPEN_POISTIONS, f"open_positions_{date_str}.csv", data)
+            self.excel_utility.save_to_csv(self.excel_utility.NOTIFICATIONS, f"discord_{date_str}.csv", data)
 
             # Spawn async updater for true balance
             threading.Thread(
@@ -282,7 +296,7 @@ class SolanaManager:
             return buy_signature
 
         except Exception as e:
-            logger.error(f"❌ Exception during buy: {e}")
+            self.logger.error(f"❌ Exception during buy: {e}")
             return None
 
     def get_sol_price(self) -> float:
@@ -310,7 +324,7 @@ class SolanaManager:
             "X-API-KEY": self.bird_api_key["BIRD_EYE"],
         }
         response = requests.get(url, headers=headers)
-        logger.debug(f"response: {response.json()}")
+        self.logger.debug(f"response: {response.json()}")
         return response.json()["data"]["value"]
 
     def get_solana_token_worth_in_dollars(self, usd_amount: int) -> float:
@@ -340,31 +354,32 @@ class SolanaManager:
             return token_amount
 
         except Exception as e:
-            logger.error(f"❌ Error getting token worth in USD: {e}")
+            self.logger.error(f"❌ Error getting token worth in USD: {e}")
             return None
 
-    def get_quote(self, input_mint, output_mint, amount=1000, slippage=5):
+    def get_quote(self, input_mint, output_mint, amount=1000, slippage=1):
         try:
+            slippage_bps = int(slippage * 100)
             self.jupiter_rate_limiter.wait()
-            quote_url = f"{JUPITER_STATION['QUOTE_ENDPOINT']}?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage}"
+            quote_url = f"{JUPITER_STATION['QUOTE_ENDPOINT']}?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}&restrictIntermediateTokens=true"
             quote_response = self.jupiter_requests.get(quote_url)
 
             if "error" in quote_response:
-                logger.warning(f"⚠️ Quote attempt failed: {quote_response['error']}")
+                self.logger.warning(f"⚠️ Quote attempt failed: {quote_response['error']}")
                 return None
 
-            logger.info(f"✅ Successfully retrieved quote.")
-            logger.debug(f"Build swap transaction: {quote_response} Success.")
+            self.logger.info(f"✅ Successfully retrieved quote.")
+            self.logger.debug(f"Build swap transaction: {quote_response} Success.")
             return quote_response
 
         except Exception as e:
-            logger.error(f"❌ Error retrieving quote: {e}")
+            self.logger.error(f"❌ Error retrieving quote: {e}")
             return None
 
     def get_swap_transaction(self, quote_response: dict):
         """Get a swap transaction from Jupiter API (Raydium/Orca)"""
         if not quote_response or "error" in quote_response:
-            logger.error(f"❌ There is an error in quote: {quote_response}")
+            self.logger.error(f"❌ There is an error in quote: {quote_response}")
             return None
 
         try:
@@ -377,7 +392,7 @@ class SolanaManager:
             )
 
             if "error" in swap_response:
-                logger.warning(
+                self.logger.warning(
                     f"⚠️ Error getting swap transaction: {swap_response['error']}"
                 )
                 return None
@@ -386,34 +401,34 @@ class SolanaManager:
 
             try:
                 raw_bytes = base64.b64decode(swap_txn_base64)
-                logger.info(f"✅ Swap transaction decoded successfully")
+                self.logger.info(f"✅ Swap transaction decoded successfully")
                 raw_tx = VersionedTransaction.from_bytes(raw_bytes)
                 signed_tx = VersionedTransaction(raw_tx.message, [self.keypair])
-                logger.debug(
+                self.logger.debug(
                     f"Signed transaction: {signed_tx}, Wallet address: {self.wallet_address}"
                 )
-                logger.info(
+                self.logger.info(
                     f"Signed transaction for Wallet address: {self.wallet_address}"
                 )
                 seralized_tx = bytes(signed_tx)
                 signed_tx_base64 = base64.b64encode(seralized_tx).decode("utf-8")
-                logger.debug(f"signed base64 transaction: {signed_tx_base64}")
-                logger.info(f"signed base64 transaction")
+                self.logger.debug(f"signed base64 transaction: {signed_tx_base64}")
+                self.logger.info(f"signed base64 transaction")
                 try:
                     tx_signature = str(signed_tx.signatures[0])
-                    logger.info(f"Transaction signature: {tx_signature}")
+                    self.logger.info(f"Transaction signature: {tx_signature}")
                 except Exception as e:
-                    logger.error(f"❌ Transaction signature extraction failed: {e}")
+                    self.logger.error(f"❌ Transaction signature extraction failed: {e}")
                     tx_signature = None
 
             except Exception as e:
-                logger.error(f"❌ Swap transaction is not valid Base64: {e}")
+                self.logger.error(f"❌ Swap transaction is not valid Base64: {e}")
                 return None
 
             return signed_tx_base64
 
         except Exception as e:
-            logger.error(f"❌ Error building swap transaction: {e}")
+            self.logger.error(f"❌ Error building swap transaction: {e}")
             return None
 
     def simulate_transaction(self, transaction_base64):
@@ -422,15 +437,15 @@ class SolanaManager:
         try:
             self.helius_rate_limiter.wait()
             response = self.helius_requests.post(
-                endpoint=self.api_key["HELIUS_API_KEY"],
+                endpoint=self.api_key,
                 payload=self.transaction_simulation_paylod,
             )
-            logger.debug(f"Transaction Simulation Response: {response}")
+            self.logger.debug(f"Transaction Simulation Response: {response}")
 
             # Check if "error" exists in response
             if "error" in response:
-                logger.warning(f"⚠️ Simulation failed: {response['error']}")
-                logger.error(
+                self.logger.warning(f"⚠️ Simulation failed: {response['error']}")
+                self.logger.error(
                     f"simulation result: {response.get('result', 'No result')}"
                 )
                 return False
@@ -438,14 +453,14 @@ class SolanaManager:
             # Check if "err" exists inside response["result"]["value"]
             err = response.get("result", {}).get("value", {}).get("err")
             if err is not None:
-                logger.warning(f"⚠️ Simulation failed with error: {err}")
+                self.logger.warning(f"⚠️ Simulation failed with error: {err}")
                 return False  # Now correctly detects failure
 
-            logger.info("✅ Transaction simulation successful!")
+            self.logger.info("✅ Transaction simulation successful!")
             return True
 
         except Exception as e:
-            logger.error(f"❌ Error simulating transaction: {e}")
+            self.logger.error(f"❌ Error simulating transaction: {e}")
             return False
 
     def get_token_decimals(
@@ -459,13 +474,13 @@ class SolanaManager:
             if response.value.decimals:
                 return math.ceil(response.value.decimals)
             else:
-                logger.warning(
+                self.logger.warning(
                     f"⚠️ Failed to retrieve decimals for {token_mint}, defaulting to 6."
                 )
                 return 6
 
         except Exception as e:
-            logger.error(f"❌ Error getting token decimals: {e}")
+            self.logger.error(f"❌ Error getting token decimals: {e}")
             return 6
 
     def get_token_supply(self, mint_address: str) -> float:
@@ -489,26 +504,26 @@ class SolanaManager:
             market_cap = price* supply
             return market_cap
         except Exception as e:
-            logger.error("Not Legit token")
+            self.logger.error("Not Legit token")
 
     def sell(self, input_mint: str, output_mint: str) -> dict:
-        logger.info(f"🔄 Initiating sell order: Selling {input_mint} for {output_mint}")
+        self.logger.info(f"🔄 Initiating sell order: Selling {input_mint} for {output_mint}")
 
         try:
             # 1. Get token balance
             balances = self.get_account_balances()
             token_info = next((t for t in balances if t["token_mint"] == input_mint), None)
             if not token_info or token_info["balance"] <= 0:
-                logger.warning(f"⚠️ No balance found for token: {input_mint}")
+                self.logger.warning(f"⚠️ No balance found for token: {input_mint}")
                 return {"success": False, "executed_price": 0.0, "signature": ""}
 
             decimals = self.get_token_decimals(input_mint)
             raw_amount = int(token_info["balance"] * (10 ** decimals))
 
             # 2. Get quote
-            quote = self.get_quote(input_mint, output_mint, raw_amount)
+            quote = self.get_quote(input_mint, output_mint, raw_amount,self.slippage)
             if not quote:
-                logger.warning("⚠️ Failed to get quote.")
+                self.logger.warning("⚠️ Failed to get quote.")
                 return {"success": False, "executed_price": 0.0, "signature": ""}
 
             # 3. Execute transaction
@@ -519,15 +534,15 @@ class SolanaManager:
 
             self.helius_rate_limiter.wait()
             response = self.helius_requests.post(
-                self.api_key["HELIUS_API_KEY"], payload=self.send_transaction_payload
+                self.api_key, payload=self.send_transaction_payload
             )
-
-            if "error" in response:
-                logger.error(f"❌ Sell failed: {response['error']}")
-                return {"success": False, "executed_price": 0.0, "signature": ""}
-
             signature = response["result"]
-            logger.info(f"✅ Sell completed: Signature: {signature}")
+            
+            # if not self.verify_signature(signature):
+            #     return {"success": False, "executed_price": 0.0, "signature": ""}
+
+            
+            self.logger.info(f"✅ Sell completed: Signature: {signature}")
 
             # 4. Calculate executed price from quote
             executed_price = float(quote["outAmount"]) / float(quote["inAmount"])
@@ -539,14 +554,14 @@ class SolanaManager:
             }
 
         except Exception as e:
-            logger.error(f"❌ Exception during sell: {e}")
+            self.logger.error(f"❌ Exception during sell: {e}")
             return {"success": False, "executed_price": 0.0, "signature": ""}
 
     def is_token_scam(self, response_json, token_mint) -> bool:
 
         # Check if a swap route exists
         if "routePlan" not in response_json or not response_json["routePlan"]:
-            logger.warning(f"🚨 No swap route for {token_mint}. Possible honeypot.")
+            self.logger.warning(f"🚨 No swap route for {token_mint}. Possible honeypot.")
             return True
 
         best_route = response_json["routePlan"][0]["swapInfo"]
@@ -556,29 +571,29 @@ class SolanaManager:
 
         fee_ratio = fee_amount / in_amount if in_amount > 0 else 0
         if fee_ratio > 0.05:
-            logger.warning(
+            self.logger.warning(
                 f"⚠️ High tax detected ({fee_ratio * 100}%). Possible scam token."
             )
             return True
 
-        logger.info("token scam test - tax check passed")
+        self.logger.info("token scam test - tax check passed")
 
         if out_amount == 0:
-            logger.warning(
+            self.logger.warning(
                 f"🚨 Token has zero output in swap! No liquidity detected for {token_mint}."
             )
             return True
 
-        logger.info("token scam test - output check passed")
+        self.logger.info("token scam test - output check passed")
 
         if in_amount / out_amount > 10000:
-            logger.warning(
+            self.logger.warning(
                 f"⚠️ Unreasonable token price ratio for {token_mint}. Possible rug."
             )
             return True
 
-        logger.info("token scam test - price ratio check passed")
-        logger.info(f"✅ Token {token_mint} passed Jupiter scam detection.")
+        self.logger.info("token scam test - price ratio check passed")
+        self.logger.info(f"✅ Token {token_mint} passed Jupiter scam detection.")
         return False
     # paid version of liquidty and accurate
     def get_liqudity(self, new_token_mint: str) -> float:
@@ -591,12 +606,12 @@ class SolanaManager:
                 "X-API-KEY": self.bird_api_key["BIRD_EYE"],
             }
             response = requests.get(url, headers=headers)
-            logger.info(response.json())
-            logger.debug(f"response: {response.json()}")
+            self.logger.info(response.json())
+            self.logger.debug(f"response: {response.json()}")
             return response.json()["data"]["liquidity"]
 
         except Exception as e:
-            logger.error(f"failed to retrive liquidity: {e}")
+            self.logger.error(f"failed to retrive liquidity: {e}")
 
         return None
     # For Raydium-based logs
@@ -611,7 +626,7 @@ class SolanaManager:
         }
 
         for log in logs:
-            logger.debug(f"🔍 Log line: {log}")
+            self.logger.debug(f"🔍 Log line: {log}")
 
             if result["itsa"] is None:
                 itsa_match = re.search(r"itsa[:=]?\s*([0-9]+)", log)
@@ -626,7 +641,7 @@ class SolanaManager:
                     result["source"] = "strategy"
 
             if "initialize" in log and ("init_pc_amount" in log or "init_coin_amount" in log):
-                logger.debug(f"🔍 Raydium init log: {log}")
+                self.logger.debug(f"🔍 Raydium init log: {log}")
                 pc_match = re.search(r"init_pc_amount:\s*([0-9]+)", log)
                 coin_match = re.search(r"init_coin_amount:\s*([0-9]+)", log)
 
@@ -715,7 +730,7 @@ class SolanaManager:
             try:
                 result["yta_decimals"] = self.get_token_decimals(token_mint)
             except Exception as e:
-                logger.warning(f"⚠️ Failed to fetch decimals for {token_mint}: {e}")
+                self.logger.warning(f"⚠️ Failed to fetch decimals for {token_mint}: {e}")
                 result["yta_decimals"] = 9
 
             # Known base mints
@@ -738,13 +753,13 @@ class SolanaManager:
                             sol_price = self.get_sol_price()
                             itsa_usd = itsa_amount * sol_price
                         except Exception as e:
-                            logger.warning(f"⚠️ Failed to fetch SOL price: {e}")
+                            self.logger.warning(f"⚠️ Failed to fetch SOL price: {e}")
                             itsa_usd = 0
                     elif base_symbol in {"USDC", "USDT"}:
                         itsa_usd = itsa_amount  # Already USD
                 else:
                     # fallback if base mint is unknown
-                    logger.warning(f"⚠️ Unknown base mint for ITSA: {itsa_mint}, assuming USD = 0")
+                    self.logger.warning(f"⚠️ Unknown base mint for ITSA: {itsa_mint}, assuming USD = 0")
                     itsa_usd = 0
 
             yta_tokens = result["yta"] / (10 ** result["yta_decimals"])
@@ -753,7 +768,7 @@ class SolanaManager:
             result["token_amount"] = yta_tokens
             result["launch_price_usd"] = round(itsa_usd / yta_tokens, 8) if yta_tokens > 0 else 0
 
-            logger.debug(
+            self.logger.debug(
                 f"🧪 Liquidity calc for {token_mint} | itsa: {result['itsa']} "
                 f"| yta: {result['yta']} | USD: {result.get('liquidity_usd', 0)}"
             )
@@ -766,18 +781,18 @@ class SolanaManager:
         elif dex.lower() == "pumpfun":
             liquidity_data = self.parse__pumpfun_liquidity_logs(logs, token_mint, transaction)
         else:
-            logger.warning(f"Unknown DEX: {dex}")
+            self.logger.warning(f"Unknown DEX: {dex}")
             return 0
 
         if liquidity_data.get("liquidity_usd", 0) > 0:
             liquidity = liquidity_data["liquidity_usd"]
             launch_price = liquidity_data["launch_price_usd"]
-            logger.info(
+            self.logger.info(
                 f"💧 Liquidity detected for {token_mint} - ${liquidity:.2f}, Launch price: ${launch_price:.8f}"
             )
             return liquidity
         else:
-            logger.info("ℹ️ No liquidity info found in logs.")
+            self.logger.info("ℹ️ No liquidity info found in logs.")
             return 0
 
     def get_token_prices(self, mints: list) -> dict:
@@ -793,7 +808,7 @@ class SolanaManager:
         return float(data["data"][mint]["price"])
     
     def post_buy_delayed_check(self, token_mint, signature, liquidity, market_cap, attempt=1):
-        logger.info(f"⏳ Running DELAYED post-buy check (attempt {attempt}) for {token_mint}...")
+        self.logger.info(f"⏳ Running DELAYED post-buy check (attempt {attempt}) for {token_mint}...")
 
         results = {
             "LP_Check": "FAIL",
@@ -802,8 +817,6 @@ class SolanaManager:
             "MarketCap_Check": "FAIL",
         }
         score = 0
-        volume_stats = {"count": 0, "total_usd": 0.0}
-
         # LP lock ratio
         try:
             lp_status = self.rug_check_utility.is_liquidity_unlocked_test(token_mint)
@@ -814,7 +827,7 @@ class SolanaManager:
                 results["LP_Check"] = "RISKY"
                 score += 0.5
         except Exception as e:
-            logger.error(f"❌ LP check failed for {token_mint}: {e}")
+            self.logger.error(f"❌ LP check failed for {token_mint}: {e}")
 
         # Holder distribution
         try:
@@ -822,41 +835,54 @@ class SolanaManager:
                 results["Holders_Check"] = "PASS"
                 score += 1
         except Exception as e:
-            logger.error(f"❌ Holder distribution check failed for {token_mint}: {e}")
+            self.logger.error(f"❌ Holder distribution check failed for {token_mint}: {e}")
 
         # Volume growth since launch
         try:
             launch_info = self.volume_tracker.token_launch_info.get(token_mint, {})
-            launch_volume = launch_info.get("launch_volume", 0.0)
-            launch_time = launch_info.get("launch_time")
+            first_sig = launch_info.get("first_signature")
 
-            # Lifetime volume since first trade
-            lifetime_trades = self.volume_tracker.volume_by_token.get(token_mint, [])
-            current_volume = sum(usd for _, usd, _ in lifetime_trades)
-            buy_usd = sum(usd for _, usd, ttype in lifetime_trades if ttype == "buy")
-            sell_usd = sum(usd for _, usd, ttype in lifetime_trades if ttype == "sell")
+            signatures = self.get_recent_transactions_signatures_for_token(
+                token_mint=token_mint,
+                until=first_sig 
+            )
 
-            if current_volume > launch_volume and buy_usd > sell_usd:
+            snap_volumes = self.parse_helius_swap_volume(signatures=signatures)
+
+            for mint, v in snap_volumes.items():
+                self.volume_tracker.record_trade(
+                    mint,
+                    {
+                        "buy_usd": v.get("buy_usd", 0.0),
+                        "sell_usd": v.get("sell_usd", 0.0),
+                        "total_usd": v.get("total_usd", 0.0),
+                    },
+                    signature="post_buy"
+                )
+
+            stats = self.volume_tracker.stats(token_mint, window=999999)
+
+            if stats["total_usd"] > launch_info.get("launch_volume", 0.0) and stats["buy_usd"] > stats["sell_usd"]:
+                self.logger.info(f'poassed volume test launch volume:{launch_info.get("launch_volume", 0.0)} current volume: {stats["total_usd"] }')
                 results["Volume_Check"] = "PASS"
-                score += 1
             else:
                 results["Volume_Check"] = (
-                    f"FAIL (Launch ${launch_volume:.2f}, Now ${current_volume:.2f}, "
-                    f"Buys ${buy_usd:.2f} vs Sells ${sell_usd:.2f})"
+                    f"FAIL (Now ${stats['total_usd']:.2f}, "
+                    f"Buys ${stats['buy_usd']:.2f} vs Sells ${stats['sell_usd']:.2f})"
                 )
+
         except Exception as e:
-            logger.error(f"❌ Volume check failed for {token_mint}: {e}")
+            self.logger.error(f"❌ Volume check failed for {token_mint}: {e}")
 
-
-        # 4Market cap
+        # Market cap
         try:
             if market_cap and market_cap <= 1_000_000:
                 results["MarketCap_Check"] = "PASS"
                 score += 1
         except Exception as e:
-            logger.error(f"❌ Market cap check failed for {token_mint}: {e}")
+            self.logger.error(f"❌ Market cap check failed for {token_mint}: {e}")
 
-        logger.info(
+        self.logger.info(
             f"📊 Token {token_mint} scored {score}/4 | "
             f"LP={results['LP_Check']} | Holders={results['Holders_Check']} | "
             f"Volume={results['Volume_Check']} | MarketCap={results['MarketCap_Check']}"
@@ -865,7 +891,7 @@ class SolanaManager:
         # Save results to CSV
         try:
             self.excel_utility.save_to_csv(
-                self.excel_utility.TOKENS_DIR,
+                self.excel_utility.BACKTEST_DIR,
                 "post_buy_checks.csv",
                 {
                     "Timestamp": [datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
@@ -879,15 +905,14 @@ class SolanaManager:
                     "Volume_Check": [results["Volume_Check"]],
                     "MarketCap_Check": [results["MarketCap_Check"]],
 
-                    # 🔹 Volume essentials
-                    "Launch Time": [launch_time],
-                    "Launch Volume": [launch_volume],
-                    "Current Time": [datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-                    "Current Volume": [volume_stats.get("total_usd", 0.0)],
+                # 🔹 Volume essentials
+                "Current Buys": [stats["buy_usd"]],
+                "Current Sells": [stats["sell_usd"]],
+                "Current Volume": [stats["total_usd"]],
                 },
             )
         except Exception as e:
-            logger.error(f"❌ Failed to save post-buy checks for {token_mint}: {e}")
+            self.logger.error(f"❌ Failed to save post-buy checks for {token_mint}: {e}")
 
         return {"score": score, "results": results}
 
@@ -907,7 +932,7 @@ class SolanaManager:
             #  Check Mint Authority (Prevents Rug Pulls)
             mint_authority = mint_info.get("mint_authority", None)
             if mint_authority:
-                logger.warning(
+                self.logger.warning(
                     f"🚨 Token {token_mint} still has mint authority ({mint_authority})! HIGH RISK."
                 )
                 return False
@@ -915,32 +940,32 @@ class SolanaManager:
             ## Check Freeze Authority (Prevents Wallet Freezing)
             freeze_authority = mint_info.get("freeze_authority", None)
             if freeze_authority:
-                logger.warning(
+                self.logger.warning(
                     f"🚨 Token {token_mint} has freeze authority ({freeze_authority})! Devs can freeze funds. HIGH RISK."
                 )
                 return False
 
 
             if self.rug_check_utility.is_liquidity_unlocked(token_mint):
-                    logger.warning(
+                    self.logger.warning(
                         f"🚨 Token {token_mint} is mutable, owned by dev, AND liquidity is NOT locked! HIGH RISK."
                     )
                     return False
             else:
-                logger.info(
+                self.logger.info(
                         f"⚠️ Token {token_mint} is mutable & dev-owned, but liquidity is locked. Might be safe."
                     )
 
-            logger.info(f"✅ Token {token_mint} Safe to proceed.")
+            self.logger.info(f"✅ Token {token_mint} Safe to proceed.")
             return True
 
         except Exception as e:
-            logger.error(f"❌ Error checking scam tests: {e}")
+            self.logger.error(f"❌ Error checking scam tests: {e}")
             return False
     
     def get_largest_accounts(self, token_mint: str):
         """Fetch largest token holders and analyze risk."""
-        logger.info(f"🔍 Checking token holders for {token_mint} using Helius...")
+        self.logger.info(f"🔍 Checking token holders for {token_mint} using Helius...")
 
         # Prepare payload
         self.largest_accounts_payload["id"] = self.id
@@ -950,21 +975,21 @@ class SolanaManager:
         try:
             self.helius_rate_limiter.wait()
             response_json = self.helius_requests.post(
-                endpoint=self.api_key["HELIUS_API_KEY"],
+                endpoint=self.api_key,
                 payload=self.largest_accounts_payload,
             )
 
-            special_logger.debug(f"🔍 Raw Helius Largest Accounts Response: {response_json}")
+            self.special_logger.debug(f"🔍 Raw Helius Largest Accounts Response: {response_json}")
 
             if "result" not in response_json:
-                logger.warning(f"⚠️ Unexpected Helius response structure: {response_json}")
+                self.logger.warning(f"⚠️ Unexpected Helius response structure: {response_json}")
                 return False
 
             holders = response_json["result"]["value"]
             total_supply = self.get_token_supply(token_mint)
 
             if total_supply == 0:
-                logger.error("❌ Failed to fetch token supply. Skipping analysis.")
+                self.logger.error("❌ Failed to fetch token supply. Skipping analysis.")
                 return False
 
             # Sort holders by balance
@@ -997,16 +1022,16 @@ class SolanaManager:
             if top_holder_percentages[0] < 2 and max(top_holder_percentages[1:]) > 6:
                 return False
 
-            logger.info("✅ Token Holder Analysis Complete.")
+            self.logger.info("✅ Token Holder Analysis Complete.")
             return True
 
         except Exception as e:
-            logger.error(f"❌ Error fetching largest accounts from Helius: {e}")
+            self.logger.error(f"❌ Error fetching largest accounts from Helius: {e}")
             return False
 
     def get_burned_accounts(self, token_mint: str):
         """Fetch largest token holders and analyze risk."""
-        logger.info(f"🔍 Checking token holders for {token_mint} using Helius...")
+        self.logger.info(f"🔍 Checking token holders for {token_mint} using Helius...")
 
         # Prepare payload
         self.largest_accounts_payload["id"] = self.id
@@ -1016,14 +1041,14 @@ class SolanaManager:
         try:
             self.helius_rate_limiter.wait()
             response_json = self.helius_requests.post(
-                endpoint=self.api_key["HELIUS_API_KEY"],
+                endpoint=self.api_key,
                 payload=self.largest_accounts_payload,
             )
 
-            special_logger.debug(f"🔍 Raw Helius Largest Accounts Response: {response_json}")
+            self.special_logger.debug(f"🔍 Raw Helius Largest Accounts Response: {response_json}")
 
             if "result" not in response_json:
-                logger.warning(f"⚠️ Unexpected Helius response structure: {response_json}")
+                self.logger.warning(f"⚠️ Unexpected Helius response structure: {response_json}")
                 return False
 
             holders = response_json["result"]["value"]
@@ -1045,7 +1070,7 @@ class SolanaManager:
                     })
             return burned_accounts
         except Exception as e:
-            logger.error(f"❌ Error fetching burned accounts from Helius: {e}")
+            self.logger.error(f"❌ Error fetching burned accounts from Helius: {e}")
             return False
 
     def get_mint_account_info(self, mint_address: str) -> dict:
@@ -1092,19 +1117,19 @@ class SolanaManager:
         }
 
     def get_token_meta_data(self, token_mint: str):
-        special_logger.info(f"🔍 Fetching metadata for {token_mint} using Helius...")
+        self.special_logger.info(f"🔍 Fetching metadata for {token_mint} using Helius...")
         self.asset_payload["id"] = self.id
         self.id += 1
         try:
             self.asset_payload["params"]["id"] = token_mint
             self.helius_rate_limiter.wait()
             response_json = self.helius_requests.post(
-                endpoint=self.api_key["HELIUS_API_KEY"],
+                endpoint=self.api_key,
                 payload=self.asset_payload,
             )
 
             if "result" not in response_json:
-                logger.warning(f"⚠️ Unexpected Helius response structure: {response_json}")
+                self.logger.warning(f"⚠️ Unexpected Helius response structure: {response_json}")
                 return False
 
             result = response_json["result"]
@@ -1120,91 +1145,10 @@ class SolanaManager:
                 "token_address": token_address,
             }
         except Exception as e:
-            logger.error(f"❌ Error fetching token data: {e}")
+            self.logger.error(f"❌ Error fetching token data: {e}")
             return False
     
-    def extract_swap_volume(self, tx_data: dict, token_mint: str) -> dict:
-        try:
-            meta = tx_data.get("meta", {})
-
-            pre_balances = meta.get("preTokenBalances", [])
-            post_balances = meta.get("postTokenBalances", [])
-
-            logger.debug(f"🔍 Pre balances: {pre_balances}")
-            logger.debug(f"🔍 Post balances: {post_balances}")
-
-            buy_usd, sell_usd = 0.0, 0.0
-
-            for pre in pre_balances:
-                mint = pre.get("mint")
-                post = next(
-                    (b for b in post_balances if b["accountIndex"] == pre["accountIndex"]),
-                    None
-                )
-
-                logger.debug(
-                    f"⚖️ Checking mint {mint} | pre={pre.get('uiTokenAmount')} | post={post.get('uiTokenAmount') if post else None}"
-                )
-
-                if not post:
-                    continue
-
-                before_amt = float(pre["uiTokenAmount"]["uiAmount"] or 0)
-                after_amt = float(post["uiTokenAmount"]["uiAmount"] or 0)
-                delta = after_amt - before_amt
-
-                logger.debug(f"📊 Mint {mint}: before={before_amt}, after={after_amt}, delta={delta}")
-
-                if abs(delta) < 1e-12:
-                    continue
-
-                # Convert to USD
-                usd_value = 0.0
-                if mint == "So11111111111111111111111111111111111111112":  # WSOL
-                    try:
-                        sol_price = self.get_sol_price()
-                    except Exception as e:
-                        logger.warning(f"⚠️ Failed to fetch SOL price: {e}")
-                        sol_price = 0.0
-                    usd_value = abs(delta) * sol_price
-                elif mint in {
-                    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-                    "Es9vMFrzaCERc1eZqDum62vD9BTezVXNid1QH2G2Vw5B",  # USDT
-                }:
-                    usd_value = abs(delta)  # already USD
-                else:
-                    logger.debug(f"❓ Unknown base mint {mint}, skipping pricing")
-                    usd_value = 0.0
-
-                if delta < 0:
-                    buy_usd += usd_value
-                    logger.debug(f"🟢 BUY detected: {usd_value} USD")
-                else:
-                    sell_usd += usd_value
-                    logger.debug(f"🔴 SELL detected: {usd_value} USD")
-
-            result = {
-                "token_mint": token_mint,
-                "buy_usd": round(buy_usd, 2),
-                "sell_usd": round(sell_usd, 2),
-                "total_usd": round(buy_usd + sell_usd, 2),
-            }
-
-            logger.info(f"📦 Swap volume result: {result}")
-            return result
-
-        except Exception as e:
-            logger.error(f"❌ Failed to extract swap volume: {e}", exc_info=True)
-            return {
-                "token_mint": token_mint,
-                "buy_usd": 0.0,
-                "sell_usd": 0.0,
-                "total_usd": 0.0,
-            }
-
     def get_token_accounts_by_owner(self, pool_address: str):
-        logger.info(f"🔍 Checking token pool reserves using Helius...")
-
         # Prepare payload
         self.token_account_by_owner["id"] = self.id
         self.id += 1
@@ -1214,14 +1158,14 @@ class SolanaManager:
         try:
             self.helius_rate_limiter.wait()
             response_json = self.helius_requests.post(
-                endpoint=self.api_key["HELIUS_API_KEY"],
+                endpoint=self.api_key,
                 payload=self.token_account_by_owner,
             )
 
-            special_logger.debug(f"🔍 Raw Helius token accounts by owner Response: {response_json}")
+            self.special_logger.debug(f"🔍 Raw Helius token accounts by owner Response: {response_json}")
 
             if "result" not in response_json:
-                logger.warning(f"⚠️ Unexpected Helius response structure: {response_json}")
+                self.logger.warning(f"⚠️ Unexpected Helius response structure: {response_json}")
                 return False
 
             accounts = response_json.get("result", {}).get("value", {}).get("accounts", [])
@@ -1238,7 +1182,7 @@ class SolanaManager:
 
             return reserves
         except Exception as e:
-                    logger.error(f"❌ Failed to fetch pool reserves: {e}", exc_info=True)
+                    self.logger.error(f"❌ Failed to fetch pool reserves: {e}", exc_info=True)
                     return []
     
     def calculate_on_chain_price(self,reserve_token: int,token_decimals: int,reserve_base: int,base_decimals: int,base_symbol: str,sol_price: float) -> float:
@@ -1263,17 +1207,15 @@ class SolanaManager:
         try:
             reserves = self.get_token_accounts_by_owner(pool_address)
             if len(reserves) < 2:
-                logger.warning(f"⚠️ Pool {pool_address} has insufficient reserves")
+                self.logger.warning(f"⚠️ Pool {pool_address} has insufficient reserves")
                 return 0.0
 
-            # Split reserves into token vs base
             token_reserve = next(r for r in reserves if r["mint"] == token_mint)
             base_reserve = next(r for r in reserves if r["mint"] != token_mint)
 
-            # Detect base symbol
             base_info = KNOWN_BASES.get(base_reserve["mint"])
             if not base_info:
-                logger.warning(f"⚠️ Unknown base mint {base_reserve['mint']} in pool {pool_address}")
+                self.logger.warning(f"⚠️ Unknown base mint {base_reserve['mint']} in pool {pool_address}")
                 return 0.0
 
             return self.calculate_on_chain_price(
@@ -1286,14 +1228,14 @@ class SolanaManager:
             )
 
         except Exception as e:
-            logger.error(f"❌ Failed to fetch on-chain price for {token_mint}: {e}", exc_info=True)
+            self.logger.error(f"❌ Failed to fetch on-chain price for {token_mint}: {e}", exc_info=True)
             return 0.0
 
     def get_current_price_on_chain(self, token_mint: str) -> float:
         """Lookup stored pool for a token and return its USD price."""
         pool_entry = self.token_pools.get(token_mint)
         if not pool_entry:
-            logger.warning(f"⚠️ No pool stored for {token_mint}, cannot fetch price.")
+            self.logger.warning(f"⚠️ No pool stored for {token_mint}, cannot fetch price.")
             return 0.0
 
         pool_address = pool_entry["pool"] if isinstance(pool_entry, dict) else pool_entry
@@ -1321,18 +1263,18 @@ class SolanaManager:
                 self.token_pools[token_mint] = {"pool": pool_address, "dex": dex}
 
                 if prev_entry and prev_entry["pool"] != pool_address:
-                    logger.info(
+                    self.logger.info(
                         f"🔄 Token {token_mint} migrated pool "
                         f"{prev_entry['pool']} ({prev_entry['dex']}) → {pool_address} ({dex})"
                     )
                     migration_flag = "MIGRATED"
                 else:
-                    logger.info(f"💾 Stored pool {pool_address} ({dex}) for {token_mint}")
+                    self.logger.info(f"💾 Stored pool {pool_address} ({dex}) for {token_mint}")
                     migration_flag = "NEW"
 
                 # Save/update CSV with migration info
                 self.excel_utility.save_to_csv(
-                    self.excel_utility.TOKENS_DIR,
+                    self.excel_utility.BACKTEST_DIR,
                     "Pair_keys.csv",
                     {
                         "Token Mint": [token_mint],
@@ -1342,10 +1284,10 @@ class SolanaManager:
                     },
                 )
             else:
-                logger.warning(f"⚠️ No pool detected for {token_mint}")
+                self.logger.warning(f"⚠️ No pool detected for {token_mint}")
 
         except Exception as e:
-            logger.warning(f"⚠️ Failed to store pool for {token_mint}: {e}")
+            self.logger.warning(f"⚠️ Failed to store pool for {token_mint}: {e}")
 
     def detect_pool_pda(self, post_token_balances: list[dict], token_mint: str) -> str | None:
 
@@ -1380,7 +1322,7 @@ class SolanaManager:
             return None
 
         # ✅ Return the owner with the largest combined WSOL+token balance
-        logger.debug(f"token owners are {valid_pools}")
+        self.logger.debug(f"token owners are {valid_pools}")
         best_owner, _ = max(valid_pools, key=lambda x: x[1])
         return best_owner
 
@@ -1395,9 +1337,9 @@ class SolanaManager:
             token_info = next((b for b in balances if b['token_mint'] == output_mint), None)
             if token_info and token_info['balance'] > 0:
                 token_received = token_info['balance']
-                logger.info(f"✅ Token received after buy: {token_received}")
+                self.logger.info(f"✅ Token received after buy: {token_received}")
                 break
-            logger.warning(f"🔁 Attempt {attempt + 1}: Token not received yet...")
+            self.logger.warning(f"🔁 Attempt {attempt + 1}: Token not received yet...")
 
         if token_received > 0:
             real_entry_price = usd_amount / token_received
@@ -1410,8 +1352,185 @@ class SolanaManager:
             "Token_Received": [token_received],
         })
 
-        self.excel_utility.save_to_csv(self.excel_utility.BOUGHT_TOKENS, f"bought_tokens_{date_str}.csv", data)
-        self.excel_utility.save_to_csv(self.excel_utility.BOUGHT_TOKENS, "open_positions.csv", data)
-        self.excel_utility.save_to_csv(self.excel_utility.BOUGHT_TOKENS, f"discord_{date_str}.csv", data)
+        self.excel_utility.save_to_csv(self.excel_utility.OPEN_POISTIONS, f"bought_tokens_{date_str}.csv", data)
+        self.excel_utility.save_to_csv(self.excel_utility.OPEN_POISTIONS, f"open_positions_{date_str}.csv", data)
+        self.excel_utility.save_to_csv(self.excel_utility.NOTIFICATIONS, f"discord_{date_str}.csv", data)
 
-        logger.info(f"📊 Entry price updated for {output_mint}: {real_entry_price:.8f} USD")
+        self.logger.info(f"📊 Entry price updated for {output_mint}: {real_entry_price:.8f} USD")
+
+    def get_transaction_data(self, signature: str) -> str | None:
+        try:
+            self.helius_rate_limiter.wait()
+            self.transaction_payload["id"] = self.id
+            self.transaction_payload["params"][0] = signature
+            self.id += 1
+            response = self.helius_requests.post(
+                endpoint=self.api_key, payload=self.transaction_payload
+            )
+            return response
+        except Exception as e:
+            self.logger.error(f"❌ Error resolving mint for TX {signature}: {e}")
+        return None
+    
+    def get_token_age(self, mint_address: str) -> int | None:
+        """Returns age of the mint in seconds. If fails, returns None."""
+        try:
+            self.helius_rate_limiter.wait()
+            self.signature_for_adress["id"] = self.id
+            self.id += 1
+            self.signature_for_adress["params"][0] = mint_address
+            response = self.helius_requests.post(
+                endpoint=self.api_key,
+                payload=self.signature_for_adress
+            )
+
+            if "result" in response and response["result"]:
+                first_tx = response["result"][0]
+                if "blockTime" in first_tx and first_tx["blockTime"]:
+                    return int(time.time()) - int(first_tx["blockTime"])
+        except Exception as e:
+            self.logger.error(f"❌ Error fetching token age: {e}")
+        return None
+    
+    def get_recent_transactions_signatures_for_token(self, token_mint: str,until=None,before=None) -> list[str]:
+        try:     
+            self.helius_rate_limiter.wait()         
+            self.signature_for_adress["id"] = self.id
+            self.id += 1
+            self.signature_for_adress["params"][0] = token_mint
+            if before:
+                self.signature_for_adress["params"][1]["before"] = before  
+            if until:
+                self.signature_for_adress["params"][1]["until"] = until
+            response = self.helius_requests.post(
+                endpoint=self.api_key,
+                payload=self.signature_for_adress
+            )
+
+            txs = response.get("result", [])
+            self.logger.debug(f"pulled transactions:{txs}")
+            return [tx.get("signature") for tx in txs if "signature" in tx]
+        except Exception as e:
+            self.logger.error(f"❌ Failed to fetch recent TXs for token {token_mint}: {e}")
+            return []  
+    
+    def parse_helius_swap_volume(self, signatures: list[str]) -> dict:
+        volumes = {}
+
+        def fetch_batch(batch):
+            try:
+                self.helius_rate_limiter.wait()
+                payload = {"transactions": batch}
+                return self.helius_enhanced.post(endpoint=self.api_key, payload=payload)
+            except Exception as e:
+                self.logger.error(f"❌ Error fetching batch: {e}")
+                return []
+
+        self.logger.info(f"🔍 Extracting volume for {len(signatures)} signatures...")
+
+        try:
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                futures = [
+                    executor.submit(fetch_batch, signatures[i:i+100])
+                    for i in range(0, len(signatures), 100)
+                ]
+
+                for f in as_completed(futures):
+                    txs = f.result()
+                    for tx in txs:
+                        swap = tx.get("events", {}).get("swap")
+                        if swap:
+                            token_inputs = swap.get("tokenInputs", [])
+                            token_outputs = swap.get("tokenOutputs", [])
+
+                            for native_side, label in [("nativeInput", "buy"), ("nativeOutput", "sell")]:
+                                native = swap.get(native_side)
+                                if native:
+                                    lamports = int(native.get("amount", 0))
+                                    sol_amount = lamports / 1e9
+                                    usd_value = sol_amount * self.get_sol_price()
+                                    self._accumulate(volumes, "So11111111111111111111111111111111111111112", label, usd_value)
+
+                        else:
+                            token_inputs = tx.get("tokenTransfers", [])
+                            token_outputs = [] 
+                            for nt in tx.get("nativeTransfers", []):
+                                lamports = int(nt.get("amount", 0))
+                                if lamports:
+                                    sol_amount = lamports / 1e9
+                                    usd_value = sol_amount * self.get_sol_price()
+                                    self._accumulate(volumes, "So11111111111111111111111111111111111111112", "sell", usd_value)
+                        for t in token_inputs + token_outputs:
+                            mint = t.get("mint")
+                            raw_amt = t.get("rawTokenAmount", {})
+                            decimals = raw_amt.get("decimals") or t.get("decimals", 9)
+                            token_amt = raw_amt.get("tokenAmount") or t.get("tokenAmount", 0)
+                            amount = float(token_amt) / (10 ** decimals)
+
+                            base_info = KNOWN_BASES.get(mint)
+                            if base_info and base_info["symbol"] in {"USDC", "USDT"}:
+                                usd_value = amount
+                            elif base_info and base_info["symbol"] == "SOL":
+                                usd_value = amount * self.get_sol_price()
+                            else:
+                                usd_price = self.get_current_price_on_chain(mint)
+                                usd_value = usd_price * amount if usd_price else 0.0
+
+                            buy, sell = (usd_value, 0.0) if t in token_inputs else (0.0, usd_value)
+
+                            if mint not in volumes:
+                                volumes[mint] = {"buy_usd": 0.0, "sell_usd": 0.0}
+                            volumes[mint]["buy_usd"] += buy
+                            volumes[mint]["sell_usd"] += sell
+                            volumes[mint]["total_usd"] = volumes[mint]["buy_usd"] + volumes[mint]["sell_usd"]
+
+        except Exception as e:
+            self.logger.error(f"❌ Error extracting volume: {e}")
+            return {}
+
+        total_usd = sum(v["total_usd"] for v in volumes.values())
+        self.logger.info(f"✅ Finished volume extraction — {len(volumes)} tokens, total volume ${total_usd:,.2f}")
+        return volumes
+
+    def _accumulate(self, volumes, mint, label, usd_value):
+        if mint not in volumes:
+            volumes[mint] = {"buy_usd": 0.0, "sell_usd": 0.0}
+        volumes[mint][f"{label}_usd"] += usd_value
+        volumes[mint]["total_usd"] = volumes[mint]["buy_usd"] + volumes[mint]["sell_usd"]
+
+    def verify_signature(self, signature: str, data: dict = None, date_str: str = None, token: str = None, action: str = "BUY") -> bool:
+        max_retries = 3
+        delay = 3
+
+        for attempt in range(max_retries):
+            try:
+                response = self.get_transaction_data(signature)
+                result = response.get("result")
+                if result:
+                    err = result.get("meta", {}).get("err", None)
+                    if err is None:
+                        self.logger.info(f"✅ {action} CONFIRMED for {token or signature}")
+                        if data and date_str:
+                            data["type"] = [action]
+                            self.excel_utility.save_to_csv(self.excel_utility.OPEN_POISTIONS, f"open_positions_{date_str}.csv", data)
+                            self.excel_utility.save_to_csv(self.excel_utility.NOTIFICATIONS, f"discord_{date_str}.csv", data)
+                        return True
+                    else:
+                        self.logger.warning(f"❌ {action} FAILED for {token or signature}, err={err}")
+                        if data and date_str:
+                            data["type"] = [f"FAILED_{action}"]
+                            self.excel_utility.save_to_csv(self.excel_utility.OPEN_POISTIONS, f"open_positions_{date_str}.csv", data)
+                            self.excel_utility.save_to_csv(self.excel_utility.NOTIFICATIONS, f"discord_{date_str}.csv", data)
+                        return False
+            except Exception as e:
+                self.logger.debug(f"⚠️ Error verifying {signature}: {e}")
+
+            if attempt < max_retries - 1:
+                self.logger.info(f"⏳ Waiting {delay}s before retrying verification ({attempt+1}/{max_retries})...")
+                time.sleep(delay)
+
+        self.logger.warning(f"❌ {action} {signature} not found after {max_retries*delay}s")
+        if data and date_str:
+            data["type"] = [f"FAILED_{action}"]
+            self.excel_utility.save_to_csv(self.excel_utility.OPEN_POISTIONS, f"open_positions_{date_str}.csv", data)
+        return False

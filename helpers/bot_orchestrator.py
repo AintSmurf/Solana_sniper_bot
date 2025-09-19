@@ -1,14 +1,12 @@
-# helpers/bot_orchestrator.py
 import threading
 import time
 from helpers.open_positions import OpenPositionTracker
-from helpers.rate_limiter import RateLimiter
 from connectors.helius_connector import HeliusConnector
 from helpers.logging_manager import LoggingHandler
 from notification.manager import NotificationManager
-from helpers.trade_counter import TradeCounter
+from helpers.bot_context import BotContext
+from helpers.solana_manager import SolanaManager
 from helpers.volume_tracker import VolumeTracker
-import pandas as pd
 
 
 
@@ -16,41 +14,36 @@ logger = LoggingHandler.get_logger()
 
 
 class BotOrchestrator:
-    def __init__(self, trade_counter:TradeCounter, settings):
-        self.settings = settings
-        self.trade_counter  = trade_counter
+    def __init__(self, ctx: BotContext):
+        self.ctx = ctx
+        self.settings = self.ctx.settings
+        self.trade_counter = self.ctx.trade_counter
         self.trade_counter.reset()
-        self.volume_tracker = VolumeTracker()
+        
+        self.volume_tracker = VolumeTracker(ctx=ctx)
+        self.ctx.register("volume_tracker",  self.volume_tracker)
 
+        self.solana_manager = SolanaManager(ctx=ctx)
+        self.ctx.register("solana_manager", self.solana_manager)
 
+        self.tracker = OpenPositionTracker(ctx=ctx)
+        self.ctx.register("open_position_tracker",  self.tracker)
+
+        self.notification_manager = NotificationManager(ctx=ctx)
+        self.ctx.register("notification_manager", self.notification_manager)
 
         # Stop flags
         self.stop_ws = threading.Event()
         self.stop_fetcher = threading.Event()
         self.stop_tracker = threading.Event()
         self.stop_retry = threading.Event()
-
-        # Rate limiter
-        helius_rl = settings["RATE_LIMITS"]["helius"]
-        self.rate_limiter = RateLimiter(
-            min_interval=helius_rl["min_interval"],
-            jitter_range=helius_rl["jitter_range"],
-            max_requests_per_minute=helius_rl["max_requests_per_minute"],
-            name=helius_rl["name"],
-        )
-
+        
         # Core components
         self.helius_connector = HeliusConnector(
-            rate_limiter=self.rate_limiter,
-            trade_counter=trade_counter,
+            ctx=ctx,
             stop_ws=self.stop_ws,
             stop_fetcher=self.stop_fetcher,
-            volume_tracker=self.volume_tracker,
         )
-        self.tracker = OpenPositionTracker(rate_limiter=self.rate_limiter)
-
-        # Unified notifier (Discord now; Slack/Telegram later)
-        self.notifier = NotificationManager(settings)
 
         self.threads: list[threading.Thread] = []
 
@@ -76,7 +69,7 @@ class BotOrchestrator:
         self._safe_run(self.tracker.retry_failed_sells, "Retry", self.stop_retry)
 
         # Start notifications (its own asyncio loop thread)
-        self.notifier.start()
+        self.notification_manager.start()
 
         logger.info("🚀 Bot started with all components")
 
@@ -109,7 +102,7 @@ class BotOrchestrator:
 
         # 3. Stop notifier
         try:
-            self.notifier.shutdown()
+            self.notification_manager.shutdown()
         except Exception as e:
             logger.warning(f"⚠️ Notifier shutdown failed: {e}")
 
@@ -118,24 +111,5 @@ class BotOrchestrator:
             if t.is_alive():
                 t.join(timeout=2)
 
-        # 5. Only one place logs shutdown
         logger.info("🛑 Bot fully shutdown.")
-
-    def get_api_stats(self):
-        return {
-            "helius": self.rate_limiter.get_stats(),
-            "jupiter": self.helius_connector.solana_manager.jupiter_rate_limiter.get_stats()
-        }
     
-    def close_trade(self, token_mint):
-        df = pd.read_csv(self.tracker.file_path)
-        row = df[df["Token_bought"] == token_mint].iloc[0]
-
-        input_mint = row["Token_sold"]
-        executed_price_usd = self.tracker.solana_manager.get_token_price(token_mint)
-        mode = self.settings["SIM_MODE"]
-
-        if mode:
-            self.tracker.simulated_sell_and_log(token_mint, input_mint, executed_price_usd, trigger="MANUAL_UI")
-        else:
-            self.tracker.sell_and_update(token_mint, input_mint, trigger="MANUAL_UI")

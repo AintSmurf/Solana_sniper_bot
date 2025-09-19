@@ -1,7 +1,6 @@
-from config.urls import RUGCHECK
+from config.third_parties import RUGCHECK
 from utilities.requests_utility import RequestsUtility
 from helpers.logging_manager import LoggingHandler
-from pprint import pprint
 
 # set up logger
 logger = LoggingHandler.get_logger()

@@ -2,28 +2,16 @@ import time
 import json
 import websocket
 from datetime import datetime
-from utilities.credentials_utility import CredentialsUtility
-from utilities.excel_utility import ExcelUtility
-from utilities.requests_utility import RequestsUtility
-from helpers.logging_manager import LoggingHandler
-from helpers.solana_manager import SolanaManager
 from helpers.framework_manager import get_payload
-from config.urls import HELIUS_URL
-from config.web_socket import HELIUS
+from config.network import HELIUS_WS
 from collections import deque
-from utilities.rug_check_utility import RugCheckUtility
 import threading
 from config.dex_detection_rules import DEX_DETECTION_RULES
-from config.settings import get_bot_settings
 from config.blacklist import BLACK_LIST
-from helpers.trade_counter import TradeCounter
-from helpers.volume_tracker import VolumeTracker
-from helpers.rate_limiter import RateLimiter
+from helpers.bot_context import BotContext
 
 
 
-# set up logger
-logger = LoggingHandler.get_logger()
 
 # Track processed signatures to avoid duplicates
 signature_queue = deque(maxlen=500)
@@ -34,66 +22,61 @@ signature_to_token_mint = {}
 
 
 known_tokens = set()
-BOT_SETTINGS = get_bot_settings()
-MAX_TOKEN_AGE_SECONDS = BOT_SETTINGS["MAX_TOKEN_AGE_SECONDS"]
-MIN_TOKEN_LIQUIDITY = BOT_SETTINGS["MIN_TOKEN_LIQUIDITY"]
-TRADE_AMOUNT=BOT_SETTINGS["TRADE_AMOUNT"]
-SIM_MODE = BOT_SETTINGS["SIM_MODE"]
 
 
 
 class HeliusConnector:
-    def __init__(self, rate_limiter:RateLimiter, trade_counter:TradeCounter, stop_ws, stop_fetcher,volume_tracker:VolumeTracker,devnet=False):
-        self.volume_tracker = volume_tracker
+    def __init__(self,ctx: BotContext,stop_ws, stop_fetcher):
+
+        #threads + rate limiters
         self.stop_ws = stop_ws
         self.stop_fetcher = stop_fetcher
-        self.trade_counter = trade_counter
-        self.helius_rate_limiter = rate_limiter 
-        logger.info("Initializing Helius WebSocket connection...")
-        credentials_utility = CredentialsUtility()
-        self.rug_utility = RugCheckUtility()
-        self.excel_utility = ExcelUtility()
-        self.solana_manager = SolanaManager(self.helius_rate_limiter)
-        self.requests_utility = RequestsUtility(HELIUS_URL["BASE_URL"])
-        self.api_key = credentials_utility.get_helius_api_key()
-        self.dex_name = credentials_utility.get_dex()["DEX"]     
-        self.rpc_call_counter = 0 
+        self.helius_rate_limiter = ctx.rate_limiters["helius"]
+
+
+        #bot settings
+        self.bot_settings = ctx.settings
+        self.network = self.bot_settings["NETWORK"]
+        self.max_token_age = self.bot_settings["MAX_TOKEN_AGE_SECONDS"]
+        self.min_token_liquidity = self.bot_settings["MIN_TOKEN_LIQUIDITY"]
+        self.trade_amount=self.bot_settings["TRADE_AMOUNT"]
+        self.sim_mode = self.bot_settings["SIM_MODE"]
+
+        #objects + keys
+        self.ctx = ctx
+        self.logger = self.ctx.logger
+        self.logger.info("Initializing objects Helius class...")  
+        self.notification_manager = self.ctx.get("notification_manager")
+        self.solana_manager =  self.ctx.get("solana_manager")
+        self.volume_tracker = self.ctx.get("volume_tracker")
+        self.trade_counter = self.ctx.trade_counter    
+        self.rug_utility = self.ctx.rug_check
+        self.excel_utility = self.ctx.excel_utility
+        self.requests_utility = self.ctx.helius_requests
+        self.api_key = self.ctx.api_keys["helius"]
+        self.dex_name = self.ctx.api_keys["dex"]     
+        
+        #local instances
+        self.logger = self.ctx.logger
         self.transaction_timers = {}
         self.flow_timer_by_token = {} 
-        self.last_rpc_log_time = time.time()
-        if devnet:
-            self.wss_url = HELIUS["LOGS_SOCKET_DEVNET"] + self.api_key["HELIUS_API_KEY"]
-        else:
-            self.wss_url = HELIUS["LOGS_SOCKET_MAINNET"] + self.api_key["HELIUS_API_KEY"]
-        logger.info(self.wss_url)
+        
+        self.logger.info("Initializing Helius WebSocket connection...")
+        self.wss_url = HELIUS_WS[self.network] + self.api_key
+        self.logger.info(f"🌐 Using network: {self.network}")
         self.prepare_files()
         self.id = 1
 
     def prepare_files(self) -> None:
         self.dex_payload = get_payload(self.dex_name)
-        self.transaction_payload = get_payload("Transaction")
-        self.transaction_simulation_payload = get_payload("Transaction_simulation")
-        self.token_address_payload = get_payload("Token_adress_payload")
-        self.block_time_payload = get_payload("Blocktime_payload")
-        self.metadata = get_payload("Asset_payload")
 
     def fetch_transaction(self, signature: str, tx_data=None):
-        logger.info(f"Fetching transaction details for: {signature}")
-
+        self.logger.info(f"Fetching transaction details for: {signature}")
         if tx_data is None:
-            self.transaction_payload["id"] = self.id
-            self.transaction_payload["params"][0] = signature
-            self.id += 1
-
             try:
-                self.helius_rate_limiter.wait()
-                tx_data = self.requests_utility.post(
-                    endpoint=self.api_key["HELIUS_API_KEY"], payload=self.transaction_payload
-                )
-                self.rpc_call_counter += 1
-                self._log_rpc_usage()
+                tx_data = self.solana_manager.get_transaction_data(signature)
             except Exception as e:
-                logger.error(f"❌ Error fetching transaction data: {e}")
+                self.logger.error(f"❌ Error fetching transaction data: {e}")
                 return
         try:
             results = tx_data.get("result", {})
@@ -101,45 +84,38 @@ class HeliusConnector:
             token_mint = self.extract_new_mint(post_token_balances)
 
             if token_mint in BLACK_LIST:
-                logger.info(f"⛔ Token {token_mint} is blacklisted — skipping.")
+                self.logger.info(f"⛔ Token {token_mint} is blacklisted — skipping.")
                 return
             if token_mint in [None, "N/A"]:
-                logger.warning(f"⚠️ Invalid token mint for TX {signature}")
+                self.logger.warning(f"⚠️ Invalid token mint for TX {signature}")
                 return
 
             logs = results.get("meta", {}).get("logMessages", [])
-            logger.debug(f"transaction response: {tx_data}")
+            self.logger.debug(f"transaction response: {tx_data}")
 
             if token_mint == "So11111111111111111111111111111111111111112":
-                logger.info("⏩ Ignoring transaction: This is a SOL transaction.")
+                self.logger.info("⏩ Ignoring transaction: This is a SOL transaction.")
                 return
 
-            age = self._get_token_age(token_mint)
+            age = self.solana_manager.get_token_age(token_mint)
             if age is None:
-                logger.warning(f"⛔ Token {token_mint} analysis took too long. Skipping.")
+                self.logger.warning(f"⛔ Token {token_mint} analysis took too long. Skipping.")
                 self.cleanup(token_mint)
                 return
 
-            if age > MAX_TOKEN_AGE_SECONDS:
-                logger.warning(f"⏳ Token {token_mint} is too old ({age:.2f}s) — skipping.")
+            if age > self.max_token_age:
+                self.logger.warning(f"⏳ Token {token_mint} is too old ({age:.2f}s) — skipping.")
                 self.cleanup(token_mint)
                 return
 
-            logger.info(f"✅ Passed Step 6: Token {token_mint} is {age:.2f}s old.")
+            self.logger.info(f"✅ Passed Step 6: Token {token_mint} is {age:.2f}s old.")
 
 
             if token_mint in known_tokens:
-                logger.debug(f"⏩ Ignoring known token: {token_mint}")
+                self.logger.debug(f"⏩ Ignoring known token: {token_mint}")
                 self.cleanup(token_mint)
                 return
             
-            # record swap events for volume tracking
-            volume = self.solana_manager.extract_swap_volume(results, token_mint)
-            if volume["total_usd"] > 0:
-                self.volume_tracker.record_trade(token_mint, volume)
-                stats = self.volume_tracker.stats(token_mint, window=300)
-                logger.info(f"📊 {token_mint} stats — {stats}")
-
             
 
             now = datetime.now()
@@ -151,9 +127,10 @@ class HeliusConnector:
             
 
 
-            if liquidity > MIN_TOKEN_LIQUIDITY:
+            if liquidity > self.min_token_liquidity:
                 #get token marketcap
                 market_cap = self.solana_manager.get_token_marketcap(token_mint)
+
 
                 known_tokens.add(token_mint)
                 self.excel_utility.save_to_csv(
@@ -170,7 +147,7 @@ class HeliusConnector:
 
                 scam_safe = self.solana_manager.check_scam_functions_helius(token_mint)
                 if not scam_safe:
-                    logger.warning(f"❌ Scam check failed — skipping {token_mint}")
+                    self.logger.warning(f"❌ Scam check failed — skipping {token_mint}")
                     self.cleanup(token_mint)
                     return
                 # Capture pool mapping before deciding to buy
@@ -178,34 +155,43 @@ class HeliusConnector:
                     token_mint=token_mint,
                     transaction=results, 
                 )
-                if SIM_MODE and not self.trade_counter.reached_limit():
-                    logger.info(f"🧪 [SIM_MODE] Would BUY {token_mint} with ${TRADE_AMOUNT}")
+
+                # record swap events for volume tracking
+                threading.Thread(target=self.volume_worker,args=(token_mint, signature), daemon=True).start()
+
+                
+                if self.sim_mode and not self.trade_counter.reached_limit():
+                    self.logger.info(f"🧪 [SIM_MODE] Would BUY {token_mint} with ${self.trade_amount}")
                     self.solana_manager.buy(
                         "So11111111111111111111111111111111111111112",
                         token_mint,
-                        TRADE_AMOUNT,
-                        SIM_MODE
+                        self.trade_amount,
+                        self.sim_mode
                     )
                     self.trade_counter.increment()
                 elif not self.trade_counter.reached_limit():
                     self.solana_manager.buy(
                         "So11111111111111111111111111111111111111112",
                         token_mint,
-                        TRADE_AMOUNT
+                        self.trade_amount
                     )
                     self.trade_counter.increment()
                 else:
-                    logger.critical("💥 MAXIMUM_TRADES reached — skipping trade.")
+                    self.logger.critical("💥 MAXIMUM_TRADES reached — skipping trade.")
                     signature_queue.clear()
-                logger.info(f"🚀 LIQUIDITY passed: ${liquidity:.2f} — considering buy for {token_mint} transaction signature:{signature}")
+                self.logger.info(f"🚀 LIQUIDITY passed: ${liquidity:.2f} — considering buy for {token_mint} transaction signature:{signature}")
                 
                 #calculate flow time
                 start_time = self.flow_timer_by_token.pop(token_mint, None)
+                duration = 0
                 if start_time:
                     duration = time.time() - start_time
-                    logger.info(f"🕒 Flow duration for {token_mint}: {duration:.2f} seconds")
+                    self.logger.info(f"🕒 Flow duration for {token_mint}: {duration:.2f} seconds")
                 else:
-                    logger.warning(f"⚠️ No start time found for {token_mint}")
+                    self.logger.warning(f"⚠️ No start time found for {token_mint}")
+                #send notification
+                msg = (f"🟢 **New token detected**\n"f"`{token_mint}`\n"f"• Est. Liquidity: ${liquidity:,.2f}\n"f"• signature: `{signature}`\n"f"• 🕒 Flow duration: {duration:,.2f}\n")
+                self.notification_manager.notify_text(msg,"live")
                 
                 t = threading.Timer(
                     60.0,
@@ -218,10 +204,10 @@ class HeliusConnector:
 
 
             else:
-                logger.info("⛔ Liquidity too low — skipping.")
+                self.logger.info("⛔ Liquidity too low — skipping.")
 
         except Exception as e:
-            logger.error(f"❌ Error processing transaction logic: {e}", exc_info=True)
+            self.logger.error(f"❌ Error processing transaction logic: {e}", exc_info=True)
 
     def run_transaction_fetcher(self):
         while not self.stop_fetcher.is_set():
@@ -229,7 +215,7 @@ class HeliusConnector:
                 time.sleep(0.4)
                 continue
 
-            logger.info(
+            self.logger.info(
                 f"🔄 Fetching transactions for {len(signature_queue)} new signatures..."
             )
 
@@ -244,12 +230,12 @@ class HeliusConnector:
                         tx_data = None
                     self.fetch_transaction(signature, tx_data)
                 except IndexError:
-                    logger.warning("⚠️ Attempted to pop from an empty signature queue.")
+                    self.logger.warning("⚠️ Attempted to pop from an empty signature queue.")
                     break
 
     def start_ws(self) -> None:
         """Starts the WebSocket connection to Helius RPC."""
-        logger.info(f"Connecting to WebSocket: {self.wss_url}")
+        self.logger.info(f"Connecting to WebSocket: {self.wss_url}")
 
         self.ws = websocket.WebSocketApp(
             self.wss_url,
@@ -263,40 +249,40 @@ class HeliusConnector:
             try:
                 self.ws.run_forever()
             except Exception as e:
-                logger.error(f"❌ WebSocket error: {e}")
+                self.logger.error(f"❌ WebSocket error: {e}")
 
             if self.stop_ws.is_set():
                 try:
                     if self.ws:
                         self.ws.close()
-                    logger.info("🔌 WebSocket closed due to shutdown request.")
+                    self.logger.info("🔌 WebSocket closed due to shutdown request.")
                 except Exception as e:
-                    logger.error(f"❌ Error while closing WebSocket: {e}")
+                    self.logger.error(f"❌ Error while closing WebSocket: {e}")
                 break
 
             # 🔄 If not shutting down → reconnect after 5s
-            logger.warning("WebSocket connection closed. Reconnecting in 5s...")
+            self.logger.warning("WebSocket connection closed. Reconnecting in 5s...")
             time.sleep(5)
 
     def on_open(self, ws) -> None:
         """Subscribe to logs for new liquidity pools on solana."""
-        logger.info(f"Subscribing to {self.dex_name} AMM logs...")
+        self.logger.info(f"Subscribing to {self.dex_name} AMM logs...")
         self.dex_payload["id"] = self.id
         self.id += 1
         ws.send(json.dumps(self.dex_payload))
-        logger.info("✅ Successfully subscribed to liquidity logs.")
+        self.logger.info("✅ Successfully subscribed to liquidity logs.")
 
     def on_message(self, ws, message) -> None:
         """Handles incoming WebSocket messages for detecting new Raydium and Pump.fun tokens on Solana."""
         try:
             if not message:
-                logger.error("❌ Received an empty WebSocket message.")
+                self.logger.error("❌ Received an empty WebSocket message.")
                 return
 
             try:
                 data = json.loads(message)
             except json.JSONDecodeError as e:
-                logger.error(f"❌ Error decoding WebSocket message: {e}")
+                self.logger.error(f"❌ Error decoding WebSocket message: {e}")
                 return
 
             # Extract transaction details
@@ -308,7 +294,7 @@ class HeliusConnector:
             logs = value.get("logs", [])
             error = value.get("err", None)
 
-            logger.debug(f"websocket response: {data}")
+            self.logger.debug(f"websocket response: {data}")
 
             # Analyze error (if exists)
             if error is not None:
@@ -319,12 +305,12 @@ class HeliusConnector:
                     else:
                         custom_code = instr_err
                     hex_code = hex(custom_code) if isinstance(custom_code, int) else "N/A"
-                    logger.debug(
+                    self.logger.debug(
                         f"⚠️ TX failed with custom error {custom_code} (hex: {hex_code})"
                     )
             else:
-                logger.debug(f"⚠️ TX failed with non-custom error: {error}")
-            logger.debug(f"🔍 Raw logs for {signature}: {logs}")
+                self.logger.debug(f"⚠️ TX failed with non-custom error: {error}")
+            self.logger.debug(f"🔍 Raw logs for {signature}: {logs}")
             
             
             detection_rules = DEX_DETECTION_RULES.get(self.dex_name, [])
@@ -334,31 +320,31 @@ class HeliusConnector:
             )
 
             if not mint_related:
-                logger.debug(f"⛔ Skipping TX: No {self.dex_name} launch indicators found.")
+                self.logger.debug(f"⛔ Skipping TX: No {self.dex_name} launch indicators found.")
                 return
             # Skip duplicates
             if signature in signature_cache or signature in signature_queue:
                 return
             signature_cache.append(signature)
 
-            logger.info(f"✅ Passed Step 1+2: Unique mint TX {signature}")
+            self.logger.info(f"✅ Passed Step 1+2: Unique mint TX {signature}")
 
             #Fetch transaction data (just once)
-            logger.info(f"📤 Fetching first TX data for {signature}")
-            tx_data = self.get_transaction_data(signature)
+            self.logger.info(f"📤 Fetching first TX data for {signature}")
+            tx_data = self.solana_manager.get_transaction_data(signature)
             if not tx_data:
-                logger.warning(f"❌ Could not fetch transaction data for: {signature}")
+                self.logger.warning(f"❌ Could not fetch transaction data for: {signature}")
                 return
 
             post_token_balances = tx_data.get("result", {}).get("meta", {}).get("postTokenBalances", [])
             token_mint = self.extract_new_mint(post_token_balances)
 
             if not token_mint:
-                logger.warning(f"❌ Could not identify a new token mint in TX: {signature}")
+                self.logger.warning(f"❌ Could not identify a new token mint in TX: {signature}")
                 return
 
-            logger.debug(f"🪙 postTokenBalances for {signature}: {post_token_balances}")
-            logger.info(f"✅ Passed Step 3: Found NEW token address: {token_mint}")
+            self.logger.debug(f"🪙 postTokenBalances for {signature}: {post_token_balances}")
+            self.logger.info(f"✅ Passed Step 3: Found NEW token address: {token_mint}")
             
             #start flow timer
             self._start_detection_timer(token_mint)
@@ -366,14 +352,15 @@ class HeliusConnector:
 
             # Step 4: Add to queue with tx_data and save temporary for later to use the token address
             signature_to_token_mint[signature] = token_mint
-            logger.debug(f"🧭 Mapped Signature → Mint: {signature} → {token_mint}")
+            self.logger.debug(f"🧭 Mapped Signature → Mint: {signature} → {token_mint}")
             signature_queue.append((signature, tx_data))
-            logger.info(f"✅ Step 4: added the token to {token_mint} ->  Signature {signature}")
+            self.logger.info(f"✅ Step 4: added the token to {token_mint} ->  Signature {signature}")
+            
             # Step 6: Prefetch recent txs for the same token
             try:
-                txs = self.get_recent_transactions_for_token(token_mint)[1:5]
+                txs = self.solana_manager.get_recent_transactions_signatures_for_token(token_mint)[1:5]
                 if txs:
-                    logger.info(f"📦 Found {len(txs)} early txs after mint — pre-queuing...")
+                    self.logger.info(f"📦 Found {len(txs)} early txs after mint — pre-queuing...")
                 else:
                     return
                 for tx_sig in txs:
@@ -381,90 +368,22 @@ class HeliusConnector:
                         continue
                     signature_cache.append(tx_sig)
                     signature_queue.append((tx_sig))
-                    logger.debug(f"🧊 Queued early tx: {tx_sig}")
+                    self.logger.debug(f"🧊 Queued early tx: {tx_sig}")
             except Exception as e:
-                logger.error(f"❌ Failed to prefetch txs for {signature}: {e}")
+                self.logger.error(f"❌ Failed to prefetch txs for {signature}: {e}")
 
         except Exception as e:
-            logger.error(f"❌ Error processing WebSocket message: {e}", exc_info=True)
+            self.logger.error(f"❌ Error processing WebSocket message: {e}", exc_info=True)
 
     def on_error(self, ws, error) -> None:
         """Handles WebSocket errors."""
-        logger.error(f"WebSocket error: {error}")
+        self.logger.error(f"WebSocket error: {error}")
 
     def on_close(self, ws, close_status_code, close_msg) -> None:
         if self.stop_ws.is_set():
-                logger.info("🛑 WebSocket closed and shutdown flag is set. Not reconnecting.")
+                self.logger.info("🛑 WebSocket closed and shutdown flag is set. Not reconnecting.")
                 return
-        logger.warning(f"WebSocket connection closed. Reconnecting in 5s...\ncode:{close_status_code}, msg:{close_msg}")
-
-    def _get_block_time(self,slot):
-        self.block_time_payload["id"] = self.id
-        self.id += 1
-        self.block_time_payload["params"][0] = slot
-        self.helius_rate_limiter.wait()
-        response = self.requests_utility.post(
-            endpoint=self.api_key["HELIUS_API_KEY"], payload=self.block_time_payload
-        )
-        self.rpc_call_counter += 1
-        self._log_rpc_usage()
-        return response.get("result", 0)
-
-    def _get_token_age(self, mint_address: str) -> int | None:
-        """Returns age of the mint in seconds. If fails, returns None."""
-        try:
-            self.token_address_payload["id"] = self.id
-            self.id += 1
-            self.token_address_payload["params"][0] = mint_address
-            self.helius_rate_limiter.wait()
-            response = self.requests_utility.post(
-                endpoint=self.api_key["HELIUS_API_KEY"],
-                payload=self.token_address_payload
-            )
-
-            if "result" in response and response["result"]:
-                first_tx = response["result"][0]
-                if "blockTime" in first_tx and first_tx["blockTime"]:
-                    return int(time.time()) - int(first_tx["blockTime"])
-        except Exception as e:
-            logger.error(f"❌ Error fetching token age: {e}")
-        return None
-    
-    def get_recent_transactions_for_token(self, token_mint: str) -> list[str]:
-        try:
-            self.token_address_payload["id"] = self.id
-            self.id += 1
-            self.token_address_payload["params"][0] = token_mint
-            self.helius_rate_limiter.wait()
-            response = self.requests_utility.post(
-                endpoint=self.api_key["HELIUS_API_KEY"],
-                payload=self.token_address_payload
-            )
-
-            txs = response.get("result", [])
-            logger.debug(f"pulled transactions:{txs}")
-            self.rpc_call_counter += 1
-            self._log_rpc_usage()
-            return [tx.get("signature") for tx in txs if "signature" in tx]
-        except Exception as e:
-            logger.error(f"❌ Failed to fetch recent TXs for token {token_mint}: {e}")
-            return []
-    
-    def get_transaction_data(self, signature: str) -> str | None:
-        try:
-            self.transaction_payload["id"] = self.id
-            self.transaction_payload["params"][0] = signature
-            self.id += 1
-            self.helius_rate_limiter.wait()
-            response = self.requests_utility.post(
-                endpoint=self.api_key["HELIUS_API_KEY"], payload=self.transaction_payload
-            )
-            self.rpc_call_counter += 1
-            self._log_rpc_usage()
-            return response
-        except Exception as e:
-            logger.error(f"❌ Error resolving mint for TX {signature}: {e}")
-        return None
+        self.logger.warning(f"WebSocket connection closed. Reconnecting in 5s...\ncode:{close_status_code}, msg:{close_msg}")
 
     def cleanup(self, token_mint):
         signature_queue_copy = list(signature_queue)
@@ -486,13 +405,7 @@ class HeliusConnector:
                 signature_to_token_mint.pop(sig, None)
                 removed += 1
 
-        logger.info(f"🧹 Cleaned up {removed} signatures for token {token_mint}")
-
-    def _log_rpc_usage(self):
-        now = time.time()
-        if now - self.last_rpc_log_time >= 60: 
-            logger.info(f"📊 RPC calls used in the last minute: {self.rpc_call_counter}")
-            self.last_rpc_log_time = now
+        self.logger.info(f"🧹 Cleaned up {removed} signatures for token {token_mint}")
             
     def extract_new_mint(self, post_balances):
         for b in post_balances:
@@ -515,6 +428,37 @@ class HeliusConnector:
         if hasattr(self, "ws") and self.ws:
             try:
                 self.ws.close()  # forces run_forever() to return
-                logger.info("🔌 WebSocket manually closed.")
+                self.logger.info("🔌 WebSocket manually closed.")
             except Exception as e:
-                logger.error(f"❌ Error closing WebSocket: {e}")
+                self.logger.error(f"❌ Error closing WebSocket: {e}")
+
+    def volume_worker(self, token_mint, signature):
+        signatures = self.solana_manager.get_recent_transactions_signatures_for_token(
+            token_mint=token_mint, before=signature
+        )
+        try:
+            snap_volumes = self.solana_manager.parse_helius_swap_volume(signatures=signatures)
+
+            # aggregate all mints into one "total" volume
+            agg_buy  = sum(v.get("buy_usd", 0.0) for v in snap_volumes.values())
+            agg_sell = sum(v.get("sell_usd", 0.0) for v in snap_volumes.values())
+            aggregated = {
+                "buy_usd": agg_buy,
+                "sell_usd": agg_sell,
+                "total_usd": agg_buy + agg_sell,
+            }
+
+            self.volume_tracker.record_trade(token_mint, aggregated, signature)
+
+            self.volume_tracker.snapshot_launch(
+                token_mint,
+                timestamp=time.time(),
+                first_trade_usd=aggregated["total_usd"],
+                signature=signature,
+            )
+
+            self.logger.info(f"📊 Volume snapshot recorded for {token_mint}")
+
+        except Exception as e:
+            self.logger.error(f"❌ Volume snapshot failed for {token_mint}: {e}", exc_info=True)
+

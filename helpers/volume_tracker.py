@@ -1,44 +1,45 @@
 import time
 from collections import deque
-from utilities.excel_utility import ExcelUtility
+from helpers.bot_context import BotContext
 
 class VolumeTracker:
-    def __init__(self):
+    def __init__(self, ctx: BotContext):
+        self.ctx = ctx
+        self.excel_utility = self.ctx.excel_utility
         self.volume_by_token = {}
-        self.token_launch_info = {}  
-        self.excel_utility = ExcelUtility() 
+        self.token_launch_info = {}
 
-    def record_trade(self, token_mint: str, volume: dict):
-        """Record both buy and sell trades from a volume dict."""
+    def record_trade(self, token_mint: str, volume: dict, signature: str):
+        """Record both buy and sell trades from a volume dict, tied to a transaction signature."""
         now = time.time()
-
         if token_mint not in self.volume_by_token:
             self.volume_by_token[token_mint] = deque(maxlen=10000)
-            self._snapshot_launch(token_mint, now, volume["total_usd"])
 
         # Record buys
         if volume.get("buy_usd", 0) > 0:
-            self.volume_by_token[token_mint].append((now, volume["buy_usd"], "buy"))
+            self.volume_by_token[token_mint].append((now, volume["buy_usd"], "buy", signature))
 
         # Record sells
         if volume.get("sell_usd", 0) > 0:
-            self.volume_by_token[token_mint].append((now, volume["sell_usd"], "sell"))
+            self.volume_by_token[token_mint].append((now, volume["sell_usd"], "sell", signature))
 
-    def _snapshot_launch(self, token_mint: str, timestamp: float, first_trade_usd: float):
-        """Create a snapshot when token is first seen (with first trade volume)."""
+    def snapshot_launch(self, token_mint: str, timestamp: float, first_trade_usd: float, signature: str):
+        """Create a snapshot when token is first seen (with first trade volume + signature)."""
         self.token_launch_info[token_mint] = {
             "launch_time": timestamp,
-            "launch_volume": first_trade_usd
+            "launch_volume": first_trade_usd,
+            "first_signature": signature
         }
 
         if self.excel_utility:
             self.excel_utility.save_to_csv(
-                self.excel_utility.TOKENS_DIR,
+                self.excel_utility.BACKTEST_DIR,
                 "token_volume.csv",
                 {
                     "Token Mint": [token_mint],
                     "Launch Timestamp": [time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))],
                     "Launch Volume": [first_trade_usd],
+                    "First Signature": [signature],
                 },
             )
 

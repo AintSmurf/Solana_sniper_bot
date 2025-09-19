@@ -1,5 +1,4 @@
-from requests import get
-from config.urls import DEXSCANNER
+from config.third_parties import DEXSCANNER
 from utilities.requests_utility import RequestsUtility
 from helpers.logging_manager import LoggingHandler
 

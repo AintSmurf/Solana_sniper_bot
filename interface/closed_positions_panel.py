@@ -1,14 +1,17 @@
 import tkinter as tk
 from tkinter import ttk
 from interface.styling import *
-from config.settings import load_settings
 
 class ClosedPositionsPanel(tk.Frame):
-    def __init__(self, parent, excel_utility=None, **kwargs):
+    def __init__(self, parent, ctx, **kwargs):
         super().__init__(parent, **kwargs)
-        self.settings = load_settings()
+        
+        self.ctx = ctx
+        self.settings = ctx.settings
+        self.excel_utility = ctx.excel_utility
+        
         kwargs.setdefault("bg", BG_COLOR)
-        self.excel_utility = excel_utility
+        kwargs.setdefault("bg", BG_COLOR)
 
         style = ttk.Style()
         style.theme_use("default")
@@ -29,7 +32,7 @@ class ClosedPositionsPanel(tk.Frame):
                 background=[("active", BG_COLOR_2), ("pressed", BG_COLOR_2)],
                 foreground=[("active", FG_COLOR_WHITE), ("pressed", FG_COLOR_WHITE)])
 
-        self.columns = ["Timestamp", "Token", "Entry_USD", "Exit_USD", "PnL (%)", "Trigger"]
+        self.columns = ["Buy_Timestamp","Sell_Timestamp", "Token Address","Entry_USD", "Exit_USD", "PnL (%)", "Trigger"]
         self.tree = ttk.Treeview(self, columns=self.columns, show="headings", style="Custom.Treeview")
 
         for col in self.columns:
@@ -47,7 +50,8 @@ class ClosedPositionsPanel(tk.Frame):
             tag = "profit" if pnl_value >= 0 else "loss"
 
             self.tree.insert("", "end", values=(
-                row["Timestamp"],
+                row["Buy_Timestamp"],
+                row["Sell_Timestamp"],
                 row["Token Mint"],
                 f"{row['Entry_USD']:.6f}",
                 f"{row['Exit_USD']:.6f}",

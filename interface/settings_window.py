@@ -1,6 +1,5 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
-from config.settings import save_settings, get_bot_settings
 import ast
 from interface.styling import *
 
@@ -10,12 +9,14 @@ class SettingsConfigUI(tk.Toplevel):
     def __init__(self, parent, on_save=None):
         super().__init__(parent)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.on_save = on_save
         self.title("Sniper Bot Settings")
         self.geometry("700x750")
         self.configure(bg=BG_COLOR)
 
-        self.settings = get_bot_settings()
+        self.parent = parent
+        self.ctx = parent.ctx 
+        self.on_save = on_save
+        self.settings = self.ctx.settings
         self.entries = {}
 
         # Apply custom style
@@ -55,7 +56,8 @@ class SettingsConfigUI(tk.Toplevel):
         style.configure("Dark.TCheckbutton",
                         background=BG_COLOR,
                         foreground="white",
-                        font=("Segoe UI", 10))
+                        font=("Segoe UI", 10)),
+        
 
         # Disable hover effect (state map override)
         style.map("Dark.TCheckbutton",
@@ -72,6 +74,47 @@ class SettingsConfigUI(tk.Toplevel):
 
     def _build_form(self):
         row = 0
+
+            # --- General Section ---
+        general_frame = ttk.LabelFrame(self.scrollable_frame, text="🛠 General Settings", style="Section.TLabelframe")
+        general_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=20, pady=10)
+        row += 1
+
+        # NETWORK dropdown
+        ttk.Label(general_frame, text="NETWORK", style="FormLabel.TLabel").grid(sticky="w", padx=10, pady=(6, 2))
+        self.network_var = tk.StringVar(value=self.settings.get("NETWORK", "mainnet"))
+        self.network_dropdown = ttk.Combobox(
+            general_frame,
+            textvariable=self.network_var,
+            values=["mainnet", "devnet"],
+            state="readonly",
+            width=15
+        )
+        self.network_dropdown.grid(row=0, column=1, sticky="w", padx=10, pady=(6, 2))
+
+        desc_label = ttk.Label(general_frame, text="Blockchain network to use", style="Description.TLabel")
+        desc_label.grid(row=1, column=0, columnspan=2, sticky="w", padx=10)
+
+        # UI Mode toggle
+        # UI Mode "locked" checkbox
+        self.ui_mode_var = tk.BooleanVar(value=self.settings.get("UI_MODE", False))
+
+        chk = ttk.Checkbutton(
+            general_frame,
+            text="UI_MODE",
+            variable=self.ui_mode_var,
+            style="Dark.TCheckbutton"
+        )
+        chk.state(["selected", "disabled"])  # force it enabled + non-editable
+        chk.grid(row=2, column=0, columnspan=2, sticky="w", padx=10, pady=4)
+
+        desc_label = ttk.Label(
+            general_frame,
+            text="Graphical interface mode is enabled (cannot be changed here).",
+            style="Description.TLabel"
+        )
+        desc_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 4))
+
 
         # --- Trading Section ---
         trading_frame = ttk.LabelFrame(self.scrollable_frame, text="⚙️ Trading Settings", style="Section.TLabelframe")
@@ -160,20 +203,6 @@ class SettingsConfigUI(tk.Toplevel):
                 chk = ttk.Checkbutton(notify_frame, text=flag, variable=var, style="Dark.TCheckbutton")
                 chk.pack(anchor="w", padx=10, pady=2)
                 self.notify_flags[flag] = var
-            else:
-                lbl = ttk.Label(notify_frame, text=flag, style="FormLabel.TLabel")
-                lbl.pack(anchor="w", padx=10, pady=2)
-
-                entry = tk.Entry(notify_frame,
-                                 width=40,
-                                 bg="#2c3e50",
-                                 fg="white",
-                                 insertbackground="white",
-                                 relief="flat",
-                                 font=("Segoe UI", 10))
-                entry.insert(0, str(val))
-                entry.pack(anchor="w", padx=20, pady=2)
-                self.notify_flags[flag] = entry
 
     def _add_buttons(self, container):
         button_frame = ttk.Frame(self, style="Custom.TFrame")
@@ -248,7 +277,7 @@ class SettingsConfigUI(tk.Toplevel):
                 except (ValueError, SyntaxError):
                     val_cast = val
             self.settings[key] = val_cast
-            # Save rate limits
+        # Save rate limits
         if hasattr(self, "rate_limit_entries"):
             for api, cfg in self.settings["RATE_LIMITS"].items():
                 # min_interval
@@ -278,7 +307,10 @@ class SettingsConfigUI(tk.Toplevel):
                         cfg["jitter_range"] = [j_min_val, j_max_val]
                     except ValueError:
                         pass  # keep old values if parsing fails
-        save_settings(self.settings)
+        # ✅ Save selected network
+        if hasattr(self, "network_var"):
+            self.settings["NETWORK"] = self.network_var.get()
+            self.parent.ctx.settings_manager.save_settings(self.settings)
         if self.on_save: 
             self.on_save()                   
         messagebox.showinfo("Settings Saved", "✅ Your settings have been saved successfully.")

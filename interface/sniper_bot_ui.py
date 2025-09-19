@@ -1,17 +1,16 @@
 import tkinter as tk
 from interface.logging_panel import LoggingPanel
 from interface.closed_positions_panel import ClosedPositionsPanel
-from interface.realtime_stats_panel import RealTimeStatsPanel
 from interface.styling import *
-from helpers.trade_counter import TradeCounter
 from helpers.logging_manager import LoggingHandler
 from interface.ui_log_hanlder import UILogHandler
-from utilities.excel_utility import ExcelUtility
-from config.settings import load_settings
 from helpers.bot_orchestrator import BotOrchestrator
 from datetime import datetime
 import threading
 from interface.settings_window import SettingsConfigUI
+from helpers.bot_context import BotContext
+import pandas as pd
+import os
 
 
 
@@ -19,18 +18,21 @@ from interface.settings_window import SettingsConfigUI
 
 
 class SniperBotUI(tk.Tk):
-    def __init__(self):
+    def __init__(self,ctx:BotContext):
         super().__init__()
+        self.ctx = ctx
+        self.excel_utility = self.ctx.excel_utility
+        self.settings = self.ctx.settings
+        self.orchestrator: BotOrchestrator | None = None
+        self.tracker = None
+
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.title("Solana Sniper Bot")
         self.configure(bg=BG_COLOR)
         self.geometry("1100x700")
-        self.excel_utility = ExcelUtility()
-        self.settings = load_settings()
-        self.orchestrator: BotOrchestrator | None = None
 
         #start loop
-        self.after_id = self.after(5000, self.refresh_stats)
+        self.after_id = self.after(1000, self.refresh_stats)
 
         # === Master Layout ===
         self.grid_rowconfigure(0, weight=1)
@@ -49,31 +51,29 @@ class SniperBotUI(tk.Tk):
         # Live Tracking (LabelFrame + LoggingPanel as Treeview)
         live_frame = tk.LabelFrame(
             left_frame, text=" Live Tracking Panel",
-            font=("Arial", 12, "bold"), fg="cyan", bg=BG_COLOR, labelanchor="nw"
+            font=GLOBAL_FONT2, fg=TITLE_FG, bg=BG_COLOR, labelanchor="nw"
         )
         live_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
 
-        self._logging_frame = LoggingPanel(live_frame,bg=BG_COLOR,   close_trade_callback=self.close_trade)
+        self._logging_frame = LoggingPanel(live_frame,bg=BG_COLOR,close_trade_callback=self.close_trade)
         self._logging_frame.pack(fill="both", expand=True)
+        
         #pull messages
         ui_log_handler = UILogHandler(self._logging_frame)
         tracker_logger = LoggingHandler.get_named_logger("tracker")
         tracker_logger.addHandler(ui_log_handler)
 
-        # Closed Positions (LabelFrame + ClosedPositionsPanel)
         closed_frame = tk.LabelFrame(
             left_frame, text="Closed Positions",
-            font=("Arial", 12, "bold"), fg="cyan", bg=BG_COLOR, labelanchor="nw"
+            font=GLOBAL_FONT2, fg=TITLE_FG, bg=BG_COLOR, labelanchor="nw"
         )
         closed_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
 
-        self.closed_positions = ClosedPositionsPanel(closed_frame, excel_utility=self.excel_utility, bg=BG_COLOR)
+        self.closed_positions = ClosedPositionsPanel(closed_frame, self.ctx, bg=BG_COLOR)
         self.closed_positions.pack(fill="both", expand=True)
 
-
-        # Adjust row weights so top grows more
-        left_frame.grid_rowconfigure(1, weight=2)  # Live tracking grows
-        left_frame.grid_rowconfigure(3, weight=1)  # Closed positions smaller
+        left_frame.grid_rowconfigure(1, weight=2) 
+        left_frame.grid_rowconfigure(3, weight=1)  
         
         #=== Right SIDE ===
         self.right_frame = tk.Frame(self, bg=BG_COLOR)
@@ -81,12 +81,12 @@ class SniperBotUI(tk.Tk):
         self._build_sidebar()
       
     def start_bot_ui(self):
-        trade_counter = TradeCounter(self.settings["MAXIMUM_TRADES"])
-        self.orchestrator = BotOrchestrator(trade_counter, self.settings)
+        self.orchestrator = BotOrchestrator(self.ctx)
         self.orchestrator.start()
 
         # Keep reference for later updates
-        self.trade_counter = trade_counter  
+        self.trade_counter = self.ctx.trade_counter
+        self.tracker = self.ctx.get("open_position_tracker")
 
         # Update Total Trades immediately
         self.update_total_trades()
@@ -109,68 +109,55 @@ class SniperBotUI(tk.Tk):
         self.stop_button.config(state=tk.DISABLED)
         self.status_label.config(text="🔴 Bot Status: Stopped", fg="red")
 
-    def update_wallet_balance(self):
-        """Fetch balances and update wallet label."""
+    def _get_wallet_balances(self):
+        """Fetch balances only (no UI update)."""
         try:
-            balances = self.orchestrator.tracker.solana_manager.get_account_balances()
-
-            sol_balance = 0.0
-            usdc_balance = 0.0
-
-            for entry in balances:
-                if entry["token_mint"] == "SOL":
-                    sol_balance = entry["balance"]
-                elif entry["token_mint"].startswith("EPjFWdd5Auf"):  # USDC mint
-                    usdc_balance = entry["balance"]
-
-            self.wallet_label.config(
-                text=f"{sol_balance:.2f} SOL | ${usdc_balance:.2f} USDC"
-            )
-
+            balances = self.ctx.get("solana_manager").get_account_balances()
+            return balances
         except Exception as e:
-            print(f"Wallet update failed: {e}")
+            print(f"Wallet fetch failed: {e}")
+            return []
 
-    def update_api_calls(self):
-        stats = self.orchestrator.get_api_stats()
-        self.helius_label.config(text=f"Helius: {stats['helius']['total_requests']}")
-        self.jupiter_label.config(text=f"Jupiter: {stats['jupiter']['total_requests']}")
+    def _get_api_stats(self):
+        """Fetch API usage stats only (no UI update)."""
+        try:
+            helius_stats = self.ctx.rate_limiters["helius"].get_stats()
+            jupiter_stats = self.ctx.rate_limiters["jupiter"].get_stats()
+            return {"helius": helius_stats, "jupiter": jupiter_stats}
+        except Exception as e:
+            print(f"API stats fetch failed: {e}")
+            return {"helius": {}, "jupiter": {}}
 
     def update_total_trades(self):
-        """Update Total Trades count in the sidebar"""
-        if hasattr(self, "trade_counter"):
-            count = self.trade_counter.get_trades_count()
-            self.total_trades_label.config(text=f"Total Trades: {count}")
+        """Get total trades count."""
+        return self.trade_counter.get_trades_count() if hasattr(self, "trade_counter") else 0
 
     def refresh_stats(self):
-        """Auto-refresh stats every 5 seconds."""
         if not hasattr(self, "_refreshing") or not self._refreshing:
             self._refreshing = True
             threading.Thread(target=self._refresh_stats_worker, daemon=True).start()
         
-        # run again every 5 sec
-        self.after_id = self.after(5000, self.refresh_stats)
-    
+        self.after_id = self.after(30000, self.refresh_stats)
+
     def _refresh_stats_worker(self):
         try:
             if not self.orchestrator:
-                # Bot not running → placeholders
                 balances = [
                     {"token_mint": "SOL", "balance": 0.0},
-                    {"token_mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "balance": 0.0}
+                    {"token_mint": "USDC", "balance": 0.0}
                 ]
                 stats = {"helius": {"total_requests": 0}, "jupiter": {"total_requests": 0}}
                 trades = 0
             else:
-                balances = self.orchestrator.tracker.solana_manager.get_account_balances()
-                stats = self.orchestrator.get_api_stats()
-                trades = self.trade_counter.get_trades_count() if hasattr(self, "trade_counter") else 0
+                balances = self._get_wallet_balances()
+                stats = self._get_api_stats()
+                trades = self.update_total_trades()
 
             self.after(0, lambda: self._update_stats_ui(balances, stats, trades))
 
         except Exception as e:
             print(f"⚠️ Stats worker failed: {e}")
-            # fallback placeholders
-            self.after(0, lambda: self._update_stats_ui([], {"helius": {"total_requests": 0}, "jupiter": {"total_requests": 0}}, 0))
+            self.after(0, lambda: self._update_stats_ui([], {"helius": {}, "jupiter": {}}, 0))
         finally:
             self._refreshing = False
 
@@ -194,6 +181,7 @@ class SniperBotUI(tk.Tk):
         """Manual refresh button → refresh closed positions only."""
         try:
             self.closed_positions.refresh()
+            self.refresh_stats()
         except Exception as e:
             print(f"⚠️ Manual refresh failed: {e}")
     
@@ -226,11 +214,19 @@ class SniperBotUI(tk.Tk):
     
     def refresh_ui_from_settings(self):
         """Reload settings and refresh only dynamic sections."""
-        self.settings = load_settings()
+        self.settings = self.ctx.settings
 
         helius_val = getattr(self, "helius_label", None).cget("text") if hasattr(self, "helius_label") else "Helius: 0"
         jupiter_val = getattr(self, "jupiter_label", None).cget("text") if hasattr(self, "jupiter_label") else "Jupiter: 0"
         trades_val = getattr(self, "total_trades_label", None).cget("text") if hasattr(self, "total_trades_label") else "Total Trades: 0"
+        
+        if hasattr(self, "mode_network_label"):
+            mode = "SIM" if self.settings["SIM_MODE"] else "REAL"
+            network = self.settings.get("NETWORK", "unknown")
+            self.mode_network_label.config(
+                text=f"Mode: {mode} | Network: {network}",
+                fg="cyan"
+            )
 
         # Clear widgets inside each dynamic frame
         for frame in (self.api_frame, self.settings_frame, self.exit_rules_frame, self.notify_frame):
@@ -258,40 +254,52 @@ class SniperBotUI(tk.Tk):
         self.status_label = tk.Label(
             self.right_frame,
             text="🟡 Bot Status: Idle",
-            font=("Arial", 12, "bold"),
+            font=GLOBAL_FONT2,
             bg=BG_COLOR,
-            fg="orange",
+            fg=ORNAGE,
         )
         self.status_label.pack(fill="x", pady=(0, 10))
+
+        mode = "SIM" if self.settings["SIM_MODE"] else "REAL"
+        network = self.settings.get("NETWORK", "unknown")
+
+        self.mode_network_label = tk.Label(
+            self.right_frame,
+            text=f"Mode: {mode} | Network: {network}",
+            font=GLOBAL_FONT,
+            bg=BG_COLOR,
+            fg=TITLE_FG,
+        )
+        self.mode_network_label.pack(fill="x", pady=(0, 10))
 
         # Total Trades
         self.total_trades_label = tk.Label(
             self.right_frame,
             text="Total Trades: 0",
-            font=("Arial", 11, "bold"),
+            font=GLOBAL_FONT,
             bg=BG_COLOR,
-            fg="white",
+            fg=FG_COLOR_WHITE,
         )
         self.total_trades_label.pack(fill="x", pady=(0, 10))
 
         # Wallet (static)
-        wallet_frame = tk.LabelFrame(self.right_frame, text="💰 Wallet Balance", bg=BG_COLOR, fg="white")
+        wallet_frame = tk.LabelFrame(self.right_frame, text="💰 Wallet Balance", bg=BG_COLOR, fg=FG_COLOR_WHITE)
         wallet_frame.pack(fill="x", pady=5)
-        self.wallet_label = tk.Label(wallet_frame, text="SOL: -- | USDC: --", font=("Arial", 10, "bold"),
-                                    bg=BG_COLOR, fg="cyan")
+        self.wallet_label = tk.Label(wallet_frame, text="SOL: -- | USDC: --", font=GLOBAL_FONT2,
+                                    bg=BG_COLOR, fg=TITLE_FG)
         self.wallet_label.pack(anchor="w", padx=10, pady=2)
 
         # === Dynamic sections (saved refs so we can rebuild) ===
-        self.api_frame = tk.LabelFrame(self.right_frame, text="🌐 API Usage", bg=BG_COLOR, fg="white")
+        self.api_frame = tk.LabelFrame(self.right_frame, text="🌐 API Usage", bg=BG_COLOR, fg=FG_COLOR_WHITE)
         self.api_frame.pack(fill="x", pady=5)
 
-        self.settings_frame = tk.LabelFrame(self.right_frame, text="⚙️ Settings", bg=BG_COLOR, fg="white")
+        self.settings_frame = tk.LabelFrame(self.right_frame, text="⚙️ Settings", bg=BG_COLOR, fg=FG_COLOR_WHITE)
         self.settings_frame.pack(fill="x", pady=5)
 
-        self.exit_rules_frame = tk.LabelFrame(self.right_frame, text="🚪 Exit Rules", bg=BG_COLOR, fg="white")
+        self.exit_rules_frame = tk.LabelFrame(self.right_frame, text="🚪 Exit Rules", bg=BG_COLOR, fg=FG_COLOR_WHITE)
         self.exit_rules_frame.pack(fill="x", pady=5)
 
-        self.notify_frame = tk.LabelFrame(self.right_frame, text="🔔 Notifications", bg=BG_COLOR, fg="white")
+        self.notify_frame = tk.LabelFrame(self.right_frame, text="🔔 Notifications", bg=BG_COLOR, fg=FG_COLOR_WHITE)
         self.notify_frame.pack(fill="x", pady=5)
 
         # Build them first time
@@ -305,13 +313,13 @@ class SniperBotUI(tk.Tk):
         row1 = tk.Frame(controls_frame, bg=BG_COLOR)
         row1.pack(fill="x", pady=2)
         self.start_button = tk.Button(
-            row1, text="▶ Start Bot", bg="#2ecc71", fg="white",
-            font=("Arial", 12, "bold"), relief=tk.RAISED, command=self.start_bot_ui
+            row1, text="▶ Start Bot", bg=START_BTN_COLOR, fg=FG_COLOR_WHITE,
+            font=GLOBAL_FONT2, relief=tk.RAISED, command=self.start_bot_ui
         )
         self.start_button.pack(side="left", expand=True, fill="x", padx=5)
         self.stop_button = tk.Button(
-            row1, text="⏹ Stop Bot", bg="#e74c3c", fg="white",
-            font=("Arial", 12, "bold"), relief=tk.RAISED, command=self.stop_bot_ui, state=tk.DISABLED
+            row1, text="⏹ Stop Bot", bg=STOP_BTN_COLOR, fg=FG_COLOR_WHITE,
+            font=GLOBAL_FONT2, relief=tk.RAISED, command=self.stop_bot_ui, state=tk.DISABLED
         )
         self.stop_button.pack(side="left", expand=True, fill="x", padx=5)
 
@@ -319,14 +327,14 @@ class SniperBotUI(tk.Tk):
         row2 = tk.Frame(controls_frame, bg=BG_COLOR)
         row2.pack(fill="x", pady=2)
         self.refresh_button = tk.Button(
-            row2, text="🔄 Refresh", bg="#3498db", fg="white",
-            font=("Arial", 12, "bold"), relief=tk.RAISED, command=self.manual_refresh
+            row2, text="🔄 Refresh", bg=REFRESH_BTN_COLOR, fg=FG_COLOR_WHITE,
+            font=GLOBAL_FONT2, relief=tk.RAISED, command=self.manual_refresh
         )
         self.refresh_button.pack(side="left", expand=True, fill="x", padx=5)
 
         self.settings_button = tk.Button(
-            row2, text="⚙ Settings", bg="#9b59b6", fg="white",
-            font=("Arial", 12, "bold"), relief=tk.RAISED, command=self.open_settings
+            row2, text="⚙ Settings", bg=SETTINGS_BTN_COLOR, fg=FG_COLOR_WHITE,
+            font=GLOBAL_FONT2, relief=tk.RAISED, command=self.open_settings
         )
         self.settings_button.pack(side="left", expand=True, fill="x", padx=5)
 
@@ -342,7 +350,6 @@ class SniperBotUI(tk.Tk):
 
         # Settings
         rows = {
-            "Mode": "SIM" if self.settings["SIM_MODE"] else "REAL",
             "SLIPPAGE":f"{self.settings['SLPG']}",
             "TP": f"{self.settings['TP']}",
             "SL": self.settings["SL"],
@@ -375,12 +382,33 @@ class SniperBotUI(tk.Tk):
         self.total_trades_label.config(text=trades_val)
 
     def close_trade(self, token_mint):
-        if self.orchestrator:
-            try:
-                self.orchestrator.close_trade(token_mint)
-                self._logging_frame.add_log({
-                    "token_mint": token_mint,
-                    "event": "sell"
-                })
-            except Exception as e:
-                print(f"⚠️ Failed to close trade: {e}")
+        try:
+            if not self.tracker:
+                print("⚠️ Tracker not available")
+                return
+
+            if not os.path.exists(self.tracker.file_path):
+                print(f"⚠️ File not found: {self.tracker.file_path}")
+                return
+
+            df = pd.read_csv(self.tracker.file_path)
+
+            matches = df[df["Token_bought"] == token_mint]
+            if matches.empty:
+                print(f"⚠️ No open position found for {token_mint}")
+                return
+
+            row = matches.iloc[0]
+            input_mint = row["Token_sold"]
+
+            if self.settings["SIM_MODE"]:
+                self.tracker.simulated_sell_and_log(token_mint, input_mint, trigger="MANUAL_UI")
+            else:
+                self.tracker.sell_and_update(token_mint, input_mint, trigger="MANUAL_UI")
+            self._logging_frame.add_log({
+                "token_mint": token_mint,
+                "event": "sell"
+            })
+
+        except Exception as e:
+            print(f"⚠️ Failed to close trade: {e}")

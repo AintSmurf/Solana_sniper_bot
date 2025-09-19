@@ -12,7 +12,7 @@ WORKDIR /app
 
 # Copy requirements and credential script first (for caching)
 COPY requirements.txt ./
-COPY local_credential.sh ./
+COPY Credentials.sh ./
 
 # Install Python dependencies
 RUN pip install --upgrade pip && pip install -r requirements.txt
@@ -24,4 +24,4 @@ COPY . .
 RUN chmod +x Credentials.sh
 
 # Run: source credentials and start the bot
-CMD ["/bin/bash", "-c", "source ./local_credential.sh && python -u app.py --s"]
+CMD ["/bin/bash", "-c", "source ./Credentials.sh && python -u app.py --s"]

@@ -5,7 +5,7 @@
     "params": [
         "TRANSACTION_PLACEHOLDER",
         {
-            "maxRetries": 0,
+            "maxRetries": 2,
             "encoding": "base64",
             "preflightCommitment": "processed"
         }

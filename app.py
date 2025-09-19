@@ -1,36 +1,37 @@
-from helpers.logging_manager import LoggingHandler
-from helpers.bot_runner import prepare_settings, run_bot
-import argparse
 import sys
-from helpers.bot_runner import handle_ui_mode
+from helpers.logging_manager import LoggingHandler
+from helpers.bot_app import BotApp
+from config.settings import Settings
+from helpers.bot_context import BotContext
+from utilities.credentials_utility import CredentialsUtility
 
-# set up logger
+
 logger = LoggingHandler.get_logger()
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--s", "--server", dest="server", action="store_true",
-        help="Run in server mode (no CLI loop prompts)"
-    )
-    args = parser.parse_args()
+    credentials = CredentialsUtility()
+    credentials_dictionary = credentials.get_all()
+    
+    settings_manager = Settings()
+    first_run = settings_manager.is_first_run()
+    bot_settings = settings_manager.load_settings()
+    settings_manager.validate_bot_settings(bot_settings)
 
-    # Load settings (UI_MODE and other flags included)
-    settings = prepare_settings(headless=args.server)
-
-    if settings.get("UI_MODE", False):   
-        handle_ui_mode()
-    else:
-        run_bot(settings)
-    sys.exit(0)
-
-if __name__ == "__main__":
+    ctx = BotContext(settings=bot_settings,api_keys=credentials_dictionary,settings_manager=settings_manager, first_run=first_run) 
+    app = BotApp(ctx)
     try:
-        main()
+        app.run()
     except KeyboardInterrupt:
         logger.info("🛑 Ctrl+C received, shutting down gracefully...")
+        if app.orchestrator:
+            app.orchestrator.shutdown()
         sys.exit(0)
     except Exception as e:
         logger.error(f"❌ BOT_SETTINGS validation failed: {e}", exc_info=True)
         sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+
+
